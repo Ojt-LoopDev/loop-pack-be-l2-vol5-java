@@ -5,6 +5,7 @@ import com.loopers.domain.brand.BrandRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
 import java.util.Optional;
 
 @RequiredArgsConstructor
@@ -15,5 +16,20 @@ public class BrandRepositoryImpl implements BrandRepository {
     @Override
     public Optional<BrandModel> find(Long id) {
         return brandJpaRepository.findById(id);
+    }
+
+    @Override
+    public List<BrandModel> findAllActive() {
+        return brandJpaRepository.findAllByDeletedAtIsNull();
+    }
+
+    @Override
+    public List<BrandModel> findAllByIds(List<Long> ids) {
+        return brandJpaRepository.findAllById(ids);
+    }
+
+    @Override
+    public BrandModel save(BrandModel brand) {
+        return brandJpaRepository.save(brand);
     }
 }

@@ -5,6 +5,8 @@ import com.loopers.domain.brand.BrandService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
+
 @RequiredArgsConstructor
 @Component
 public class BrandFacade {
@@ -13,5 +15,11 @@ public class BrandFacade {
     public BrandInfo getBrand(Long id) {
         BrandModel brand = brandService.getBrand(id);
         return BrandInfo.from(brand);
+    }
+
+    public List<BrandInfo> getBrands() {
+        return brandService.getBrands().stream()
+            .map(BrandInfo::from)
+            .toList();
     }
 }
