@@ -96,4 +96,37 @@ class StockTest {
             );
         }
     }
+
+    @DisplayName("재고를 설정할 때, ")
+    @Nested
+    class Set {
+        @DisplayName("0 이상의 수량을 주면, 그 값으로 그대로 설정된다.")
+        @Test
+        void setsStock_whenQuantityIsZeroOrPositive() {
+            // arrange
+            Stock stock = new Stock(5);
+
+            // act
+            stock.set(100);
+
+            // assert
+            assertThat(stock.remaining()).isEqualTo(100);
+        }
+
+        @DisplayName("음수 수량을 주면, BAD_REQUEST 예외가 발생하고 재고는 그대로 유지된다.")
+        @Test
+        void throwsBadRequestException_whenQuantityIsNegative() {
+            // arrange
+            Stock stock = new Stock(5);
+
+            // act
+            CoreException result = assertThrows(CoreException.class, () -> stock.set(-1));
+
+            // assert
+            assertAll(
+                () -> assertThat(result.getErrorType()).isEqualTo(ErrorType.BAD_REQUEST),
+                () -> assertThat(stock.remaining()).isEqualTo(5)
+            );
+        }
+    }
 }
