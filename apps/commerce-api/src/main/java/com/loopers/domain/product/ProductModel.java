@@ -52,6 +52,13 @@ public class ProductModel extends BaseEntity {
         stock.set(quantity);
     }
 
+    /**
+     * 주문 확정 시 재고를 상대적으로 차감한다 — 관리자 재고 조정(changeStock, 절대값 지정)과는 다른 동작이다.
+     */
+    public void decreaseStock(int quantity) {
+        stock.decrease(quantity);
+    }
+
     private static void validateName(String name) {
         if (name == null || name.isBlank()) {
             throw new CoreException(ErrorType.BAD_REQUEST, "이름은 비어있을 수 없습니다.");

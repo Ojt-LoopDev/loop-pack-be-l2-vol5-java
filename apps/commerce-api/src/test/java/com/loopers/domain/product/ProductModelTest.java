@@ -187,4 +187,50 @@ class ProductModelTest {
             );
         }
     }
+
+    @DisplayName("주문 확정으로 재고를 차감할 때, ")
+    @Nested
+    class DecreaseStock {
+        @DisplayName("재고 이하의 양수 수량이면, 그만큼 상대적으로 차감된다.")
+        @Test
+        void decreasesStock_whenQuantityIsWithinRemaining() {
+            // arrange
+            ProductModel product = new ProductModel("에어맥스", 129_000L, 1L, 10);
+
+            // act
+            product.decreaseStock(3);
+
+            // assert
+            assertThat(product.getRemainingStock()).isEqualTo(7);
+        }
+
+        @DisplayName("재고보다 많은 수량이면, BAD_REQUEST 예외가 발생하고 재고는 그대로 유지된다.")
+        @Test
+        void throwsBadRequestException_whenQuantityExceedsRemaining() {
+            // arrange
+            ProductModel product = new ProductModel("에어맥스", 129_000L, 1L, 10);
+
+            // act
+            CoreException result = assertThrows(CoreException.class, () -> product.decreaseStock(11));
+
+            // assert
+            assertAll(
+                () -> assertThat(result.getErrorType()).isEqualTo(ErrorType.BAD_REQUEST),
+                () -> assertThat(product.getRemainingStock()).isEqualTo(10)
+            );
+        }
+
+        @DisplayName("0 이하의 수량이면, BAD_REQUEST 예외가 발생한다.")
+        @Test
+        void throwsBadRequestException_whenQuantityIsZeroOrNegative() {
+            // arrange
+            ProductModel product = new ProductModel("에어맥스", 129_000L, 1L, 10);
+
+            // act
+            CoreException result = assertThrows(CoreException.class, () -> product.decreaseStock(0));
+
+            // assert
+            assertThat(result.getErrorType()).isEqualTo(ErrorType.BAD_REQUEST);
+        }
+    }
 }

@@ -1,16 +1,27 @@
 package com.loopers.infrastructure.product;
 
 import com.loopers.domain.product.ProductModel;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface ProductJpaRepository extends JpaRepository<ProductModel, Long> {
     List<ProductModel> findAllByDeletedAtIsNull();
+
+    /**
+     * 비관적 락으로 조회한다 — 주문 확정 시 재고 차감 전에만 쓴다.
+     * (docs/week2/design.md 5번 섹션 "차감 → 비관적 락" 참고)
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT p FROM ProductModel p WHERE p.id = :id")
+    Optional<ProductModel> findForUpdate(@Param("id") Long id);
 
     boolean existsByBrandIdAndDeletedAtIsNull(Long brandId);
 

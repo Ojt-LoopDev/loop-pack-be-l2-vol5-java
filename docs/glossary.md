@@ -66,3 +66,17 @@
 **왜 필요한가**: 값을 복사하지 않고 매번 원본을 참조(예: `productId`로 `Product`를 다시 조회)하면, 원본이 바뀌는 순간 과거에 만든 기록까지 같이 바뀌어 보인다. "그때 그 값"을 보존해야 하는 기록(주문 내역, 영수증 등)에는 이게 오히려 문제가 된다.
 
 **이 프로젝트에서 나온 맥락**: `OrderItem`이 `Product.price`를 매번 조회하는 대신 주문 시점 가격을 자기 필드에 직접 복사해서 저장한다. 이후 관리자가 `Product.price`를 바꿔도 이미 만들어진 `OrderItem`의 저장된 단가는 그대로 유지된다. Week1의 INV-004("확정 결과 보존")도 같은 개념 — 확정된 주문의 금액은 이후 정책이 바뀌어도 재계산되지 않는다.
+
+## Self-invocation과 자동 flush가 겹쳐서 생긴 버그 (Point 충전 2배 반영)
+
+**증상**: `Point.charge(1000)`을 호출했는데 DB엔 2000으로 반영됨. 테스트로 잡음 — `assertThat(balance).isEqualTo(1000L)`이 "expected: 1000, but was: 2000"으로 실패.
+
+**Self-invocation 문제**: `@Transactional`은 Spring이 진짜 클래스를 감싼 프록시 객체에 붙는 기능이다. 그런데 같은 클래스 안에서 `this.다른메서드()`처럼 자기 자신을 호출하면(self-invocation), 그 호출은 프록시를 거치지 않고 원본 객체를 직접 부르는 셈이 된다 — 그래서 그 메서드에 붙은 `@Transactional(readOnly = true)`가 통째로 무시된다. `UserService.chargePoint()`가 내부에서 `this.getUser(id)`를 부르는 게 이 경우였다: `getUser()`의 `readOnly = true`는 무시되고, `chargePoint()`의 바깥 트랜잭션(쓰기 가능) 안에서 그대로 실행됐다.
+
+**자동 flush 문제**: JPA(Hibernate)가 관리하는 엔티티(매니지드 엔티티)를 코드에서 직접 바꾸면(예: `user.getPoint().charge(amount)`로 필드값 변경), 그 변경사항은 바로 SQL로 안 나간다 — 트랜잭션이 끝날 때, 또는 그 전에 **새로운 쿼리를 실행하기 직전에** Hibernate가 자동으로 먼저 내보낸다(flush). 이게 "지금 메모리에 있는 값과 DB에 있는 값이 다르면 다음 쿼리 결과가 틀릴 수 있으니 미리 맞춰둔다"는 안전장치다.
+
+**두 문제가 겹친 결과**: `getUser(id)`가 self-invocation 때문에 매니지드 엔티티를 돌려줬고, 거기에 `charge(1000)`을 호출해 메모리에서 잔액을 1000으로 바꿔놨다. 그다음 줄에서 원자적 UPDATE(`SET balance = balance + 1000`) 쿼리를 실행하려는 순간, Hibernate가 "아직 안 내보낸 변경사항이 있네" 하며 먼저 `UPDATE ... SET balance = 1000`을 내보냈다(자동 flush) — 그리고 나서야 원자적 UPDATE가 실행되며 `1000 + 1000 = 2000`이 됐다.
+
+**고친 방법**: 매니지드 엔티티를 건드리지 않도록, 검증만 필요한 곳엔 `new Point().charge(amount)`처럼 **영속화되지 않은 새 인스턴스**에 대고 호출해서 예외만 확인하고 버린다(이 검증 자체가 현재 잔액과 무관한 규칙이라 안전). 그리고 원자적 UPDATE 쪽엔 `@Modifying(clearAutomatically = true)`를 붙여서, 쿼리 실행 후 영속성 컨텍스트를 비우게 했다 — 그래야 그다음 조회가 캐시된 값이 아니라 DB에서 새로 읽어온다.
+
+**왜 이 프로젝트에서 특히 조심해야 하는가**: 원자적 UPDATE(`docs/glossary.md` 위 "동시성 제어" 항목)를 쓰는 이유 자체가 "JPA의 읽고-계산하고-쓰는 흐름을 건너뛰고 DB에 한 번에 맡기기" 위해서인데, 같은 트랜잭션 안에서 매니지드 엔티티를 함께 건드리면 그 "건너뛴" 흐름이 auto-flush를 통해 몰래 다시 끼어든다 — 두 전략(엔티티 기반 변경 vs 원자적 SQL)을 한 메서드 안에서 섞으면 안 된다는 교훈.

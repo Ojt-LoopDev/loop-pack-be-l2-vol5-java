@@ -19,6 +19,11 @@ public class UserRepositoryImpl implements UserRepository {
     }
 
     @Override
+    public Optional<UserModel> findForUpdate(Long id) {
+        return userJpaRepository.findForUpdate(id);
+    }
+
+    @Override
     public int chargePoint(Long id, long amount) {
         return userJpaRepository.chargePoint(id, amount);
     }
