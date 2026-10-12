@@ -93,7 +93,25 @@
 - RestAssured로 `RANDOM_PORT`에 실제 HTTP 요청을 보낸다. 시나리오는 given/when/then으로 읽히게 API 호출을 헬퍼(Steps)로 감싼다.
 - 데이터는 가능한 한 관리자 API로 준비한다. 사용자는 생성 API가 없으므로(2주차: 회원가입 범위 밖) 저장소로 직접 넣는다.
 - 기존 E2E 테스트(`TestRestTemplate`/`MockMvc`)는 그대로 둔다. 다시 쓰는 건 범위 밖이다.
-- 위치: `apps/commerce-api/src/test/java/com/loopers/acceptance/`
+- 위치: `apps/commerce-api/src/test/java/com/loopers/acceptance/` — `ProductQueryAcceptanceTest`(A1·A2·A11), `ProductChangeAcceptanceTest`(A3~A8), `OrderContractAcceptanceTest`(A9·A10).
+
+### 결정: 관리자 API는 테스트 전용 인증 수단으로 호출한다
+
+- **발견**: `AdminBoundaryConfig`는 `/api-admin/**`에 `hasRole("ADMIN")` 규칙만 두고 **인증 수단을 정하지 않았다**(이 프로젝트는 실제 인증이 범위 밖). 그래서 실제 HTTP로는 모든 관리자 요청이 403이다. 기존 관리자 E2E는 MockMvc의 `user("admin")`으로 SecurityContext를 직접 채워 우회해 왔다.
+- **비교**: (A) 테스트에만 같은 권한 규칙 + Basic 인증 + 테스트용 관리자 계정을 운영 체인보다 먼저 적용 / (B) RestAssuredMockMvc로 기존 E2E와 같은 방식 — HTTP 계층을 거치지 않음 / (C) 운영 코드에 인증 추가 — 범위 밖이고 계약 변경.
+- **결정 A** (`AcceptanceTestSecurityConfig`): 인수 테스트는 "사용자가 관찰하는 결과"를 보므로 실제 HTTP를 거치는 쪽을 택했다. 관리자를 어떻게 인증하는지는 원래 정해지지 않은 부분이라, 그 부분만 대체하는 건 기존 E2E의 `user("admin")`과 같은 수준의 우회다. `@TestConfiguration`이라 다른 테스트의 컨텍스트에는 들어가지 않는다.
+- **감수하는 것**: 운영 `AdminBoundaryConfig` 자체는 인수 테스트에서 실행되지 않는다. 테스트 체인은 CSRF도 끈다(Basic 인증 무상태 호출). "ADMIN이 아니면 403" 규칙은 기존 관리자 E2E가 계속 검증한다.
+
+### 검증 — 테스트가 실제로 계약 위반을 잡는가
+
+일부러 계약을 깨뜨리고 실패하는지 확인했다(확인 후 원복).
+
+| 변이 | 결과 |
+|---|---|
+| `size > 100` 검사 제거 | `size=101` 테스트 실패 — 잡음 |
+| `price_asc` 동점 기준 `name ASC, id ASC` → `id DESC` | **처음엔 통과 — 놓침** |
+
+처음 데이터는 가격 동점이 두 개(apple·cherry)였고 나중에 등록된 apple의 id가 더 컸다. 동점이 둘이면 가능한 순서도 둘뿐이라, 이름순은 id 정순·역순 중 하나와 반드시 겹친다 — 동점 기준이 id로 바뀌어도 테스트가 통과한다. **동점이 셋이고 이름순이 id 정순과도 역순과도 다른 데이터**(등록 순서 melon·lemon·mango)로 테스트를 추가한 뒤, `price_asc`·`likes_desc`의 동점 기준을 id로 바꾼 변이가 4개 테스트에서 실패하는 것을 확인했다.
 
 ## 4. 측정 대상과 기준선
 
