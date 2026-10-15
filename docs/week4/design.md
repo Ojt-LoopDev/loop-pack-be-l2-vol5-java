@@ -218,7 +218,7 @@
 | SQL | 전 | 후 |
 |---|---|---|
 | 목록 좋아요 집계 `IN (20개)` | 168,317행, 35.7ms | 84행, **0.1ms** (Covering index range scan) |
-| 상세 좋아요 count | skip scan, 2ms | 7행, 0.01ms |
+| 상세 좋아요 count | skip scan, 2ms | 7행, 0.04ms |
 | 브랜드7 `likes_desc` | 해시 조인, 85ms | 상품 91개마다 인덱스 조회, **0.9ms** |
 | 전체 `likes_desc` | 해시 조인 + 임시 테이블, 574ms | Nested loop, **82~99ms** — 여전히 153,642행을 매 요청 읽음 |
 | 내 좋아요 목록·중복 확인 | UK | UK (변화 없음) |
