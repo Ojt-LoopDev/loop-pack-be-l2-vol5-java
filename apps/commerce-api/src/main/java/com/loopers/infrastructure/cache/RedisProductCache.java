@@ -11,12 +11,11 @@ import com.loopers.application.product.ProductListLookup;
 import com.loopers.domain.product.ProductSort;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.data.redis.connection.RedisConnection;
-import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -47,6 +46,13 @@ public class RedisProductCache implements ProductCache {
     static final String LIST_VERSION_KEY = "product:list:version";
     // 브랜드 삭제처럼 지울 상품 키가 많을 때 DEL 하나에 담는 최대 키 수 (7번 섹션 "DEL을 묶어서 보낸다").
     private static final int DELETE_CHUNK_SIZE = 500;
+    // KEYS[i]에 ARGV[i]를 저장하고, 마지막 ARGV를 TTL(초)로 쓴다.
+    private static final RedisScript<Long> SET_ALL_WITH_TTL = new DefaultRedisScript<>(
+        "local ttl = ARGV[#ARGV] "
+            + "for i, key in ipairs(KEYS) do redis.call('SET', key, ARGV[i], 'EX', ttl) end "
+            + "return #KEYS",
+        Long.class
+    );
 
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
@@ -180,34 +186,33 @@ public class RedisProductCache implements ProductCache {
         return CacheResult.hit(found);
     }
 
-    // 여러 키를 파이프라인으로 한 번에 SET EX 한다. 직렬화에 실패한 항목은 건너뛴다.
+    // 여러 키를 Lua 스크립트 한 번(EVAL)으로 SET EX 한다 — 공유 연결로 왕복 1번. 직렬화에 실패한 항목은 건너뛴다.
+    // 경위(docs/week4/measurements/after-cache-latency.txt):
+    // 1) 파이프라인(executePipelined)은 Spring Data Redis에서 전용 연결이 필요해, 연결 풀이 없으면 호출마다 master·replica에
+    //    새 연결을 맺었다 — miss 요청당 연결 약 15개, 측정 대상 miss p50 75ms(캐시 없음 27.8ms), 연속 요청에서 임시 포트 고갈.
+    // 2) 키마다 SET EX를 차례로 보내면 연결 문제는 사라지지만 목록 miss 하나가 약 25번 왕복해 54ms였다(로컬 왕복 약 0.9ms).
+    // 쓰기 명령이라 Lettuce가 master로 보낸다(읽기만 replica 우선).
     private boolean setAll(Map<String, ?> entries) {
-        if (entries.isEmpty()) {
-            return true;
-        }
-        Map<byte[], byte[]> serialized = new LinkedHashMap<>();
         List<String> keys = new ArrayList<>();
+        List<String> args = new ArrayList<>();
         entries.forEach((key, value) -> {
             String json = serialize(key, value);
             if (json != null) {
-                serialized.put(key.getBytes(StandardCharsets.UTF_8), json.getBytes(StandardCharsets.UTF_8));
                 keys.add(key);
+                args.add(json);
             }
         });
+        if (keys.isEmpty()) {
+            return true;
+        }
+        args.add(String.valueOf(TTL_SECONDS));
         try {
-            redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
-                setEach(connection, serialized);
-                return null;
-            });
+            redisTemplate.execute(SET_ALL_WITH_TTL, keys, args.toArray());
             return true;
         } catch (RuntimeException e) {
             log.warn("캐시 저장 실패 [keys = {}]: {}", keys, e.toString());
             return false;
         }
-    }
-
-    private static void setEach(RedisConnection connection, Map<byte[], byte[]> serialized) {
-        serialized.forEach((key, value) -> connection.stringCommands().setEx(key, TTL_SECONDS, value));
     }
 
     private String serialize(String key, Object value) {

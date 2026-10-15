@@ -15,10 +15,14 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertAll;
@@ -45,6 +49,70 @@ class RedisProductCacheTest {
     @AfterEach
     void tearDown() {
         redisCleanUp.truncateAll();
+    }
+
+    @DisplayName("여러 키를 저장해도 Redis 연결을 새로 맺지 않는다 — 공유 연결을 쓴다.")
+    @Test
+    void putsWithoutOpeningNewConnections() {
+        // arrange — 공유 연결을 먼저 맺어 둔다
+        productCache.putProducts(List.of(new CachedProduct(999L, "준비", 1L, 1, 1L, 0L)));
+        long before = connectionsReceived();
+        List<CachedProduct> products = LongStream.rangeClosed(1, 20)
+            .mapToObj(id -> new CachedProduct(id, "상품" + id, 1_000L * id, 10, 7L, 0L))
+            .toList();
+
+        // act — 목록 miss 한 번이 하는 저장과 같은 양
+        productCache.putProductIds(productCache.lookupProductIds(7L, ProductSort.PRICE_ASC, 0, 20),
+            new CachedProductIds(products.stream().map(CachedProduct::id).toList(), 20L));
+        productCache.putProducts(products);
+        productCache.putBrands(List.of(new CachedBrand(7L, "나이키")));
+
+        // assert — 파이프라인은 호출마다 전용 연결을 새로 맺었다(재측정에서 miss 요청당 약 15개)
+        assertThat(connectionsReceived()).isEqualTo(before);
+    }
+
+    @DisplayName("상품 20개를 저장해도 Redis 왕복은 한 번이다 — 스크립트 한 번으로 저장한다.")
+    @Test
+    void putsManyKeysInOneRoundTrip() {
+        // arrange — 첫 호출은 스크립트가 서버에 없어 EVALSHA 실패 후 EVAL로 등록되므로, 한 번 먼저 저장해 둔다
+        productCache.putProducts(List.of(new CachedProduct(999L, "준비", 1L, 1, 1L, 0L)));
+        long before = scriptCalls();
+        List<CachedProduct> products = LongStream.rangeClosed(1, 20)
+            .mapToObj(id -> new CachedProduct(id, "상품" + id, 1_000L * id, 10, 7L, 0L))
+            .toList();
+
+        // act
+        productCache.putProducts(products);
+
+        // assert — 키마다 SET을 차례로 보내면 왕복이 20번이었다(로컬 약 0.9ms씩, 목록 miss 54ms)
+        assertAll(
+            () -> assertThat(scriptCalls()).isEqualTo(before + 1),
+            () -> assertThat(productCache.getProducts(products.stream().map(CachedProduct::id).toList()))
+                .isEqualTo(CacheResult.hit(products.stream().collect(
+                    Collectors.toMap(CachedProduct::id, product -> product)))),
+            () -> assertThat(cacheRedisTemplate.getExpire("product:20")).isBetween(1L, RedisProductCache.TTL_SECONDS)
+        );
+    }
+
+    // 스크립트 실행 명령(EVALSHA·EVAL) 호출 수의 합
+    private long scriptCalls() {
+        Properties stats = cacheRedisTemplate.execute(
+            (RedisCallback<Properties>) connection -> connection.serverCommands().info("commandstats"));
+        return callsOf(stats, "cmdstat_evalsha") + callsOf(stats, "cmdstat_eval");
+    }
+
+    private static long callsOf(Properties stats, String command) {
+        String value = stats.getProperty(command);
+        if (value == null) {
+            return 0;
+        }
+        return Long.parseLong(value.split(",")[0].substring("calls=".length()));
+    }
+
+    private long connectionsReceived() {
+        Properties stats = cacheRedisTemplate.execute(
+            (RedisCallback<Properties>) connection -> connection.serverCommands().info("stats"));
+        return Long.parseLong(stats.getProperty("total_connections_received"));
     }
 
     @DisplayName("상품·브랜드 캐시를 다룰 때,")
