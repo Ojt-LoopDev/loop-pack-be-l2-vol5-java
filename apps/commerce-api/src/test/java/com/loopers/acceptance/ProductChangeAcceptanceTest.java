@@ -1,10 +1,12 @@
 package com.loopers.acceptance;
 
+import com.loopers.utils.RedisCleanUp;
 import io.restassured.response.ExtractableResponse;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.util.List;
 import java.util.Map;
@@ -17,9 +19,14 @@ import static org.junit.jupiter.api.Assertions.assertAll;
  *
  * <p>모든 시나리오는 "먼저 조회 → 변경 → 다시 조회" 순서다. 캐시가 붙으면 첫 조회가 캐시를 채우므로,
  * 이 순서가 곧 "변경 뒤에 오래된 복사본을 보지 않는다"(인수 조건 ①)를 검증한다. A3~A8.
+ * 예외: A7(좋아요)은 캐시를 지우지 않고 TTL(60초)로 반영하기로 계약을 바꿔, 변경 뒤 Redis를 비워 캐시 만료를 흉내 낸 다음 조회한다
+ * (docs/week4/design.md 6번 섹션 "계약 변경 — 좋아요 반영 지연").
  */
 @DisplayName("상품 변경 반영")
 class ProductChangeAcceptanceTest extends AcceptanceTest {
+
+    @Autowired
+    private RedisCleanUp redisCleanUp;
 
     private Long brand;
     private Long otherBrand;
@@ -106,7 +113,7 @@ class ProductChangeAcceptanceTest extends AcceptanceTest {
         );
     }
 
-    @DisplayName("A7 — 좋아요 등록·취소는 좋아요 수와 likes_desc 순서에 반영된다.")
+    @DisplayName("A7 — 좋아요 등록·취소는 캐시가 만료되면(=Redis 비우기로 흉내 낸다) 좋아요 수와 likes_desc 순서에 반영된다. 설계 6번 섹션 계약 변경.")
     @Test
     void likeAndUnlike_reflected() {
         Long user = givenUser();
@@ -115,6 +122,8 @@ class ProductChangeAcceptanceTest extends AcceptanceTest {
         assertThat(before).containsExactly(cheap, expensive, middle);
 
         CustomerSteps.like(user, middle);
+        // 캐시 만료(=Redis 비우기)를 흉내 낸다 — 좋아요는 캐시를 지우지 않고 TTL(60초)로 반영된다 (설계 6번 섹션 계약 변경)
+        redisCleanUp.truncateAll();
 
         assertAll(
             () -> assertThat(CustomerSteps.getProductIds(Map.of("brandId", brand, "sort", "likes_desc")))
@@ -123,6 +132,8 @@ class ProductChangeAcceptanceTest extends AcceptanceTest {
         );
 
         CustomerSteps.unlike(user, middle);
+        // 취소도 같다 — 캐시 만료(=Redis 비우기)를 흉내 낸다 (설계 6번 섹션 계약 변경)
+        redisCleanUp.truncateAll();
 
         assertAll(
             () -> assertThat(CustomerSteps.getProductIds(Map.of("brandId", brand, "sort", "likes_desc")))
