@@ -24,6 +24,12 @@ spring:
       - logging.yml
       - monitoring.yml
 
+# 캐시 전용 Redis 연결(CacheRedisConfig) — 실패하면 DB로 대신하므로 짧게 기다린다 (docs/week4/design.md 8번 섹션)
+cache:
+  redis:
+    command-timeout: 50ms   # 명령 하나
+    connect-timeout: 1s     # 연결 수립(시작·재연결 때만)
+
 springdoc:
   use-fqn: true
   swagger-ui:
