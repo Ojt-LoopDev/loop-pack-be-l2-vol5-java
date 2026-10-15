@@ -6,6 +6,7 @@ import com.loopers.domain.product.ProductModel;
 import com.loopers.domain.product.ProductService;
 import com.loopers.domain.product.ProductSort;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
@@ -22,6 +23,7 @@ import java.util.Objects;
 // (docs/week2/design.md 1번 섹션: 조회 vs 변경 원칙, ProductAdminFacade와 대칭)
 // 고객 조회(상세·목록)는 cache-aside다: 캐시에 없는 것만 DB에서 읽어 채운다 (docs/week4/design.md 6번 섹션).
 // 관리자 조회(getProduct·getProducts)는 방금 바꾼 값을 바로 봐야 해서 캐시하지 않는다.
+@Slf4j
 @RequiredArgsConstructor
 @Component
 public class ProductFacade {
@@ -100,11 +102,20 @@ public class ProductFacade {
         List<ProductDetailInfo> infos = ids.stream()
             .map(productsById::get)
             .filter(Objects::nonNull)
-            .filter(product -> brandsById.containsKey(product.brandId()))
+            .filter(product -> hasBrand(product, brandsById))
             .map(product -> ProductDetailInfo.from(product, brandsById.get(product.brandId())))
             .toList();
 
         return new PageImpl<>(infos, pageable, totalElements);
+    }
+
+    // 브랜드를 찾지 못한 상품은 응답에서 빠진다. 미삭제 상품의 브랜드가 없는 것은 데이터 이상 신호라 조용히 빠지지 않게 WARN으로 남긴다.
+    private static boolean hasBrand(CachedProduct product, Map<Long, CachedBrand> brandsById) {
+        if (brandsById.containsKey(product.brandId())) {
+            return true;
+        }
+        log.warn("상품 목록에서 브랜드를 찾지 못해 상품을 건너뜀 [productId = {}, brandId = {}]", product.id(), product.brandId());
+        return false;
     }
 
     // 상품 키를 MGET하고, 빠진 상품만 DB에서 일괄조회해 채운다.
