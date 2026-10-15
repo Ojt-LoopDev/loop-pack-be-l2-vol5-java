@@ -319,7 +319,7 @@
 
 | 키 | 값 | 쓰는 곳 |
 |---|---|---|
-| `product:list:v{버전}:{brandId 또는 all}:{sort}:{page}:{size}` | `ids`, `page`, `size`, `totalElements`, `totalPages` | 목록 |
+| `product:list:v{버전}:{brandId 또는 all}:{sort}:{page}:{size}` | `ids`, `totalElements` (`page`·`size`는 키에 있고 `totalPages`는 계산한다) | 목록 |
 | `product:{id}` | `id`, `name`, `price`, `remainingStock`, `brandId`, `likeCount` | 상세, 목록 |
 | `brand:{id}` | `id`, `name` | 상세, 목록 |
 
