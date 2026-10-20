@@ -80,6 +80,8 @@ Content-Type: application/json
 | `GET /api/v1/orders/{orderId}` | 본인 주문·결제수단·시도 상태·최종 결과. **PG를 부르지 않는다** | 200 |
 | `POST /api/v1/orders/{orderId}/payment/reconcile` | 본인 미완료 시도의 기존 거래를 조회해 반영. 새 결제를 만들지 않는다 | 대기·미확인 202, 종결 200 |
 | `POST /api/v1/payments/callback` | 위 5번 | — |
+| `POST /api-admin/v1/orders/{orderId}/payment/reconcile` | (우리가 추가, D-031) 소유권 확인 없이 종결된 시도도 PG에 조회해 반영. 다른 결과면 충돌 기록 | 202 / 200 |
+| `POST /api-admin/v1/orders/{orderId}/payment/fail` | (우리가 추가, D-031) 관리자가 PG에 거래가 없음을 확인한 뒤 FAILED 처리. 처리자 기록, 감시 시작(D-013) | 200 |
 
 - 같은 PG 시도의 재요청은 저장된 결과를 돌려주고 추가 효과가 없다.
 - 이전 POINT 확정 주문을 다시 확정하면 기존 "이미 확정됨" 오류(409)를 유지한다.
