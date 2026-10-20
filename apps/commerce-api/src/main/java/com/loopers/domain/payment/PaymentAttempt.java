@@ -6,7 +6,9 @@ import com.loopers.support.error.ErrorType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
+import jakarta.persistence.Index;
 import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
 
 import java.time.ZonedDateTime;
 
@@ -21,8 +23,21 @@ import java.time.ZonedDateTime;
  *
  * 동시에 들어오는 반영은 호출자가 행 락으로 직렬화한다(D-002). 이 클래스는 잠근 뒤 읽은 상태로 판단한다.
  */
+// UK(order_id): 주문당 한 시도. 주문 락이 이미 줄을 세우지만, 주문 락을 거치지 않는 경로(관리자·배치)가 생겨도 DB가 지키는 마지막 방어선이다.
+// UK(attempt_key): 같은 키가 서로 다른 주문에 동시에 들어오면 각자 다른 주문을 잠가 직렬화되지 않는다 — 이 제약이 실제 방어선이다.
+// (docs/week5/design.md D-016) provider_order_id·transaction_key 인덱스는 callback 워커가 본문의 키로 시도를 찾는 경로다(D-021).
 @Entity
-@Table(name = "payment_attempt")
+@Table(
+    name = "payment_attempt",
+    uniqueConstraints = {
+        @UniqueConstraint(name = "uk_payment_attempt_order_id", columnNames = "order_id"),
+        @UniqueConstraint(name = "uk_payment_attempt_attempt_key", columnNames = "attempt_key")
+    },
+    indexes = {
+        @Index(name = "idx_payment_attempt_provider_order_id", columnList = "provider_order_id"),
+        @Index(name = "idx_payment_attempt_transaction_key", columnList = "transaction_key")
+    }
+)
 public class PaymentAttempt extends BaseEntity {
 
     private Long orderId;
