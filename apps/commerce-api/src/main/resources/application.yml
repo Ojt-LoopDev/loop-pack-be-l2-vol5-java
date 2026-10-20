@@ -30,6 +30,19 @@ cache:
     command-timeout: 50ms   # 명령 하나
     connect-timeout: 1s     # 연결 수립(시작·재연결 때만)
 
+# 로컬 테스트 PG (docs/week5/pg-contract.md, recovery.md 2번) — 주소는 설정으로 고정하고 고객 입력을 받지 않는다
+pg:
+  base-url: http://127.0.0.1:18080
+  user-id: "135135"
+  callback-url: http://127.0.0.1:8080/api/v1/payments/callback
+  create:
+    connect-timeout: 1s   # create는 연결·응답 timeout 모두 UNKNOWN으로 본다(D-025)
+    read-timeout: 2s
+  lookup:
+    connect-timeout: 1s
+    read-timeout: 1s
+    retry-initial-wait: 100ms  # 재조회 사이 대기 100ms → 200ms (D-028)
+
 springdoc:
   use-fqn: true
   swagger-ui:
