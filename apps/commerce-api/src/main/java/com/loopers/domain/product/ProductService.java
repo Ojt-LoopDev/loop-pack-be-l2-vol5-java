@@ -91,6 +91,17 @@ public class ProductService {
         return product;
     }
 
+    /**
+     * PG 결제 FAILED로 예약을 반환한다 — 지금 값에 더한다(상대 증가, INV-006). 관리자가 그 사이 재고를 다시 설정했어도
+     * 설정값 위에 예약분만 돌려준다. 차감과 같은 락에 참여한다.
+     */
+    @Transactional
+    public ProductModel increaseStock(Long id, int quantity) {
+        ProductModel product = getActiveProductForUpdate(id);
+        product.increaseStock(quantity);
+        return product;
+    }
+
     @Transactional
     public void deleteProduct(Long id) {
         getActiveProductForUpdate(id).delete();

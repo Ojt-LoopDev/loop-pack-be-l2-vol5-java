@@ -75,6 +75,22 @@ public class PaymentAttempt extends BaseEntity {
     }
 
     /**
+     * 이미 저장된 시도에 같은 이름표(attemptKey)의 요청이 다시 왔는지 판단한다(docs/week5/design.md D-015).
+     * 같은 주문·같은 키면 통과한다 — 호출자는 PG를 다시 부르지 않고 저장된 상태를 돌려준다(②).
+     * 400과 409는 "요청자가 입력을 바꾸면 해결되는가"로 나눈다.
+     */
+    public void assertSameRequest(Long orderId, String attemptKey) {
+        if (!this.orderId.equals(orderId)) {
+            // ④ 새 키를 붙이면 해결된다.
+            throw new CoreException(ErrorType.BAD_REQUEST, "이미 다른 주문에 사용한 결제 시도 키입니다.");
+        }
+        if (!this.attemptKey.equals(attemptKey)) {
+            // ③ 어떤 입력으로도 이 주문의 새 결제를 시작할 수 없다(주문당 시도 하나).
+            throw new CoreException(ErrorType.CONFLICT, "이미 결제를 시작한 주문입니다.");
+        }
+    }
+
+    /**
      * create가 202 PENDING으로 수락됐다. 이미 종결됐다면(빠른 callback이 먼저 반영한 경우) 늦게 도착한
      * 생성 응답이 상태를 되돌리지 않는다(INV-003 반례 1).
      */
