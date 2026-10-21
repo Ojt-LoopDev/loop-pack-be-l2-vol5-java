@@ -158,6 +158,14 @@ public class PaymentAttempt extends BaseEntity {
         };
     }
 
+    /**
+     * apply가 CONFLICT를 돌려준 관찰의 사유. 거래가 우리 기록(주문 식별자·금액·거래 키)과 어긋나면 MISMATCH,
+     * 맞는 거래인데 이미 종결된 상태와 다른 결과면 DIFFERENT_OUTCOME_AFTER_TERMINAL이다(D-011).
+     */
+    public PaymentConflictReason conflictReasonFor(PaymentObservation observation) {
+        return matches(observation) ? PaymentConflictReason.DIFFERENT_OUTCOME_AFTER_TERMINAL : PaymentConflictReason.MISMATCH;
+    }
+
     private boolean matches(PaymentObservation observation) {
         return providerOrderId.equals(observation.providerOrderId())
             && amount == observation.amount()

@@ -7,6 +7,8 @@ import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 public interface PaymentAttemptJpaRepository extends JpaRepository<PaymentAttempt, Long> {
@@ -18,6 +20,8 @@ public interface PaymentAttemptJpaRepository extends JpaRepository<PaymentAttemp
     Optional<PaymentAttempt> findByOrderIdForUpdate(@Param("orderId") Long orderId);
 
     Optional<PaymentAttempt> findByAttemptKey(String attemptKey);
+
+    List<PaymentAttempt> findAllByOrderIdIn(Collection<Long> orderIds);
 
     Optional<PaymentAttempt> findByProviderOrderId(String providerOrderId);
 

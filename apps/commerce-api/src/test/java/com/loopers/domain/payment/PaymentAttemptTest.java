@@ -304,4 +304,72 @@ class PaymentAttemptTest {
             );
         }
     }
+
+    @DisplayName("충돌 사유를 정할 때, (D-011)")
+    @Nested
+    class ConflictReason {
+        @DisplayName("관찰한 거래의 금액이 저장된 금액과 다르면, MISMATCH다.")
+        @Test
+        void mismatch_whenAmountDiffers() {
+            // arrange
+            PaymentAttempt attempt = requested();
+            PaymentObservation observation = new PaymentObservation(PROVIDER_ORDER_ID, TX_KEY, PaymentObservation.Status.SUCCESS, AMOUNT + 1);
+
+            // act
+            ApplyResult result = attempt.apply(observation);
+
+            // assert
+            assertAll(
+                () -> assertThat(result).isEqualTo(ApplyResult.CONFLICT),
+                () -> assertThat(attempt.getStatus()).isEqualTo(PaymentAttemptStatus.REQUESTED),
+                () -> assertThat(attempt.conflictReasonFor(observation)).isEqualTo(PaymentConflictReason.MISMATCH)
+            );
+        }
+
+        @DisplayName("이미 아는 거래 키와 다른 거래면, MISMATCH다.")
+        @Test
+        void mismatch_whenTransactionKeyDiffers() {
+            // arrange
+            PaymentAttempt attempt = requested();
+            attempt.accept(TX_KEY);
+            PaymentObservation other = new PaymentObservation(PROVIDER_ORDER_ID, "OTHER-TX", PaymentObservation.Status.SUCCESS, AMOUNT);
+
+            // act & assert
+            assertThat(attempt.conflictReasonFor(other)).isEqualTo(PaymentConflictReason.MISMATCH);
+        }
+
+        @DisplayName("우리 거래인데 종결된 결과와 다르면, DIFFERENT_OUTCOME_AFTER_TERMINAL이다.")
+        @Test
+        void differentOutcome_whenSameTransactionAfterTerminal() {
+            // arrange
+            PaymentAttempt attempt = requested();
+            attempt.apply(observed(PaymentObservation.Status.FAILED));
+
+            // act & assert
+            assertThat(attempt.conflictReasonFor(observed(PaymentObservation.Status.SUCCESS)))
+                .isEqualTo(PaymentConflictReason.DIFFERENT_OUTCOME_AFTER_TERMINAL);
+        }
+    }
+
+    @DisplayName("이미 저장된 시도에 같은 요청인지 물을 때, (D-015)")
+    @Nested
+    class SameRequest {
+        @DisplayName("같은 주문·같은 키면 통과한다.")
+        @Test
+        void passes_forSameOrderAndKey() {
+            requested().assertSameRequest(42L, "key-A");
+        }
+
+        @DisplayName("같은 주문·다른 키면 CONFLICT, 같은 키·다른 주문이면 BAD_REQUEST다.")
+        @Test
+        void rejects_otherwise() {
+            PaymentAttempt attempt = requested();
+            CoreException otherKey = assertThrows(CoreException.class, () -> attempt.assertSameRequest(42L, "key-B"));
+            CoreException otherOrder = assertThrows(CoreException.class, () -> attempt.assertSameRequest(43L, "key-A"));
+            assertAll(
+                () -> assertThat(otherKey.getErrorType()).isEqualTo(ErrorType.CONFLICT),
+                () -> assertThat(otherOrder.getErrorType()).isEqualTo(ErrorType.BAD_REQUEST)
+            );
+        }
+    }
 }

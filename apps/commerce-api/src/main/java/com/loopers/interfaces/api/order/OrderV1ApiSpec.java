@@ -34,6 +34,19 @@ public interface OrderV1ApiSpec {
     );
 
     @Operation(
+        summary = "결제 결과 확인 (reconcile)",
+        description = "이미 시작한 결제의 기존 거래를 PG에 조회해 반영합니다. 새 결제를 만들지 않습니다. "
+            + "결제가 아직 끝나지 않았으면 202, 끝났으면 200을 반환합니다. 이미 끝난 결제는 PG를 부르지 않고 저장된 상태를 반환하고, "
+            + "PG 조회에 실패해도 상태를 바꾸지 않고 202를 반환합니다. 결제를 시작하지 않은 주문이면 409를 반환합니다."
+    )
+    ResponseEntity<ApiResponse<OrderV1Dto.OrderResponse>> reconcilePayment(
+        @Schema(name = "X-USER-ID", description = "요청자 ID")
+        Long userId,
+        @Schema(name = "주문 ID", description = "결제를 확인할 주문의 ID")
+        Long orderId
+    );
+
+    @Operation(
         summary = "내 주문 목록 조회",
         description = "요청자의 주문 목록을 조회합니다."
     )

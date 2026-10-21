@@ -1,5 +1,7 @@
 package com.loopers.domain.payment;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 public interface PaymentAttemptRepository {
@@ -15,6 +17,9 @@ public interface PaymentAttemptRepository {
     Optional<PaymentAttempt> findByOrderIdForUpdate(Long orderId);
 
     Optional<PaymentAttempt> findByAttemptKey(String attemptKey);
+
+    /** 주문 목록에 결제 정보를 붙일 때 한 번에 읽는다(주문마다 따로 읽지 않는다). */
+    List<PaymentAttempt> findAllByOrderIdIn(Collection<Long> orderIds);
 
     /**
      * 잠그지 않고 읽는다 — callback 워커가 주문 번호(orderId)를 알아낼 때 쓴다. orderId는 생성 뒤 바뀌지 않으므로

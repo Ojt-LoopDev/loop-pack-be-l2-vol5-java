@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.exactly;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
@@ -125,6 +126,12 @@ class OrderV1ApiE2ETest {
         OrderV1Dto.ConfirmRequest body = new OrderV1Dto.ConfirmRequest(attemptKey, "TEST", "0000-0000-0000-0000");
         return testRestTemplate.exchange(
             ORDERS_URL + "/" + orderId + "/confirm", HttpMethod.POST, new HttpEntity<>(body, headers), ORDER_RESPONSE_TYPE
+        );
+    }
+
+    private ResponseEntity<ApiResponse<OrderV1Dto.OrderResponse>> reconcilePayment(Long userId, Long orderId) {
+        return testRestTemplate.exchange(
+            ORDERS_URL + "/" + orderId + "/payment/reconcile", HttpMethod.POST, requestWithUser(userId), ORDER_RESPONSE_TYPE
         );
     }
 
@@ -488,6 +495,70 @@ class OrderV1ApiE2ETest {
             assertThat(productJpaRepository.findById(product.getId()).orElseThrow().getRemainingStock()).isEqualTo(8);
             assertThat(userJpaRepository.findById(userId).orElseThrow().getPoint().getBalance()).isEqualTo(5000L);
             TestPg.server().verify(exactly(1), postRequestedFor(urlEqualTo(TestPg.PAYMENTS_PATH)));
+        }
+    }
+
+    @DisplayName("POST /api/v1/orders/{orderId}/payment/reconcile")
+    @Nested
+    class Reconcile {
+        @DisplayName("PG에서 아직 결과를 찾지 못하면, 202와 저장된 결제 상태를 반환한다.")
+        @Test
+        void returns202_whenStillInProgress() {
+            // arrange
+            ProductModel product = createProduct(1000L, 10);
+            Long userId = createUser();
+            Long orderId = createOrder(userId, List.of(new OrderV1Dto.CreateRequest.ItemRequest(product.getId(), 1)))
+                .getBody().data().id();
+            confirmOrder(userId, orderId);
+
+            // act — 테스트 PG에 단건 조회 stub이 없어 404(결과 없음)다
+            ResponseEntity<ApiResponse<OrderV1Dto.OrderResponse>> response = reconcilePayment(userId, orderId);
+
+            // assert
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+            assertThat(response.getBody().data().payment().status().name()).isEqualTo("PENDING");
+            assertThat(response.getBody().data().links().reconcile()).isNotNull();
+        }
+
+        @DisplayName("PG에서 SUCCESS를 확인하면, 200과 CONFIRMED를 반환하고 reconcile 경로를 주지 않는다.")
+        @Test
+        void returns200_whenConfirmed() {
+            // arrange
+            ProductModel product = createProduct(1000L, 10);
+            Long userId = createUser();
+            Long orderId = createOrder(userId, List.of(new OrderV1Dto.CreateRequest.ItemRequest(product.getId(), 1)))
+                .getBody().data().id();
+            confirmOrder(userId, orderId);
+            String providerOrderId = String.format("LP-ORD-%010d", orderId);
+            TestPg.server().stubFor(get(urlEqualTo(TestPg.PAYMENTS_PATH + "/" + TestPg.transactionKeyOf(providerOrderId)))
+                .willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json")
+                    .withBody("{\"transactionKey\":\"" + TestPg.transactionKeyOf(providerOrderId) + "\",\"orderId\":\"" + providerOrderId
+                        + "\",\"amount\":1000,\"status\":\"SUCCESS\"}")));
+
+            // act
+            ResponseEntity<ApiResponse<OrderV1Dto.OrderResponse>> response = reconcilePayment(userId, orderId);
+
+            // assert
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(response.getBody().data().status().name()).isEqualTo("CONFIRMED");
+            assertThat(response.getBody().data().paidAmount()).isEqualTo(1000L);
+            assertThat(response.getBody().data().links().reconcile()).isNull();
+        }
+
+        @DisplayName("결제를 시작하지 않은 주문이면, 409를 반환한다.")
+        @Test
+        void returns409_whenPaymentNotStarted() {
+            // arrange
+            ProductModel product = createProduct(1000L, 10);
+            Long userId = createUser();
+            Long orderId = createOrder(userId, List.of(new OrderV1Dto.CreateRequest.ItemRequest(product.getId(), 1)))
+                .getBody().data().id();
+
+            // act
+            ResponseEntity<ApiResponse<OrderV1Dto.OrderResponse>> response = reconcilePayment(userId, orderId);
+
+            // assert
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
         }
     }
 

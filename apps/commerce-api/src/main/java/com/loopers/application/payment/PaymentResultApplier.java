@@ -7,15 +7,21 @@ import com.loopers.domain.order.OrderService;
 import com.loopers.domain.payment.ApplyResult;
 import com.loopers.domain.payment.PaymentAttempt;
 import com.loopers.domain.payment.PaymentAttemptRepository;
+import com.loopers.domain.payment.PaymentAttemptStatus;
+import com.loopers.domain.payment.PaymentConflict;
+import com.loopers.domain.payment.PaymentConflictReason;
+import com.loopers.domain.payment.PaymentConflictRepository;
 import com.loopers.domain.payment.PaymentObservation;
 import com.loopers.domain.product.ProductService;
 import com.loopers.support.error.CoreException;
 import com.loopers.support.error.ErrorType;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Comparator;
+import java.util.Optional;
 
 /**
  * 결과 반영(TX B) — 결과가 들어오는 모든 입구(confirm·reconcile·callback 워커·스케줄러·관리자)가 지나는 경계다
@@ -25,6 +31,7 @@ import java.util.Comparator;
  * - 전이 판단은 PaymentAttempt가 하고, 여기서는 전이가 일어났을 때만 효과를 낸다(INV-002, D-001).
  * - PG 호출은 하지 않는다. 호출자가 트랜잭션 밖에서 조회한 결과를 넘긴다.
  */
+@Slf4j
 @RequiredArgsConstructor
 @Component
 public class PaymentResultApplier {
@@ -33,14 +40,26 @@ public class PaymentResultApplier {
     private final PaymentAttemptRepository paymentAttemptRepository;
     private final ProductService productService;
     private final ProductCacheInvalidator productCacheInvalidator;
+    private final PaymentConflictRepository paymentConflictRepository;
 
-    /** PG 권위 조회로 확인한 거래를 반영한다. */
+    /** PG 권위 조회로 확인한 거래를 반영한다. 어긋나면 상태는 그대로 두고 충돌로 기록한다(INV-003, D-010). */
     @Transactional
     public ApplyResult apply(Long orderId, PaymentObservation observation) {
         Locked locked = lock(orderId);
-        ApplyResult result = locked.attempt().apply(observation);
-        applyEffect(locked.order(), locked.attempt(), result);
+        PaymentAttempt attempt = locked.attempt();
+        ApplyResult result = attempt.apply(observation);
+        if (result == ApplyResult.CONFLICT) {
+            recordConflict(attempt, attempt.conflictReasonFor(observation), observation);
+        }
+        applyEffect(locked.order(), attempt, result);
         return result;
+    }
+
+    /** 같은 주문 식별자로 거래가 2건 이상 조회됐다 — 자동으로 고르지 않고 상태를 그대로 둔 채 기록한다(D-010). */
+    @Transactional
+    public void recordMultipleTransactions(Long orderId) {
+        PaymentAttempt attempt = lock(orderId).attempt();
+        recordConflict(attempt, PaymentConflictReason.MULTIPLE_TRANSACTIONS, null);
     }
 
     /** 정확한 조건의 422 — 효과 0건이 확정된 거절이라 바로 FAILED로 종결하고 예약을 돌려준다. */
@@ -55,7 +74,14 @@ public class PaymentResultApplier {
     /** create 202 PENDING — transactionKey만 기록한다. 주문·재고는 바뀌지 않는다. */
     @Transactional
     public ApplyResult recordAccepted(Long orderId, String transactionKey) {
-        return lock(orderId).attempt().accept(transactionKey);
+        PaymentAttempt attempt = lock(orderId).attempt();
+        ApplyResult result = attempt.accept(transactionKey);
+        if (result == ApplyResult.CONFLICT) {
+            // 먼저 반영된 거래와 다른 키 — 수락 응답이 말한 거래를 그대로 남긴다.
+            recordConflict(attempt, PaymentConflictReason.MISMATCH, new PaymentObservation(
+                attempt.getProviderOrderId(), transactionKey, PaymentObservation.Status.PENDING, attempt.getAmount()));
+        }
+        return result;
     }
 
     /** create 응답을 받지 못했다 — 실패가 아니라 "모른다"(INV-004). */
@@ -76,17 +102,37 @@ public class PaymentResultApplier {
             case SUCCEEDED -> order.completePayment(attempt.getAmount());
             case FAILED -> {
                 order.failPayment();
-                // 예약 반환 — 지금 값에 더한다(INV-006). 상품 락은 주문·시도 다음, id 오름차순.
+                // 예약 반환 — 지금 값에 더한다(INV-006), 삭제된 상품은 건너뛴다(D-019). 상품 락은 주문·시도 다음, id 오름차순.
                 order.getItems().stream()
                     .sorted(Comparator.comparing(OrderItem::getProductId))
-                    .forEach(item -> productService.increaseStock(item.getProductId(), item.getQuantity()));
+                    .forEach(item -> productService.returnReservedStock(item.getProductId(), item.getQuantity()));
                 productCacheInvalidator.productsChanged(order.getItems().stream()
                     .map(OrderItem::getProductId)
                     .toList());
             }
             case NO_EFFECT, CONFLICT -> {
-                // 상태를 바꾸지 않는다(INV-003). 충돌을 기록으로 남기는 일(D-010·D-011)은 아직 연결하지 않았다.
+                // 상태를 바꾸지 않는다(INV-003).
             }
+        }
+    }
+
+    /**
+     * 같은 내용의 충돌이 이미 있으면 새 행을 만들지 않는다 — 처리 전이면 마지막 발견 시각만 갱신하고, 처리 후면 무시한다.
+     * 내용이 다르면 새 행이다(D-012). 결제 시도 행을 잠근 뒤 부르므로 동시에 발견된 같은 충돌도 한 행으로 모인다.
+     */
+    private void recordConflict(PaymentAttempt attempt, PaymentConflictReason reason, PaymentObservation observation) {
+        PaymentAttemptStatus recordedStatus = attempt.getStatus();
+        Optional<PaymentConflict> same = paymentConflictRepository.findAllByAttemptId(attempt.getId()).stream()
+            .filter(conflict -> conflict.hasSameContentAs(reason, recordedStatus, observation))
+            .findFirst();
+        if (same.isEmpty()) {
+            paymentConflictRepository.save(new PaymentConflict(attempt.getId(), reason, recordedStatus, observation));
+            log.warn("결제 충돌 발견: attemptId={}, reason={}, recordedStatus={}, observed={}",
+                attempt.getId(), reason, recordedStatus, observation);
+            return;
+        }
+        if (!same.get().isResolved()) {
+            same.get().detectedAgain();
         }
     }
 

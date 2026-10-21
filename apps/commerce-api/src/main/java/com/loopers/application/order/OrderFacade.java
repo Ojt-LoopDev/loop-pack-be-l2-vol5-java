@@ -6,12 +6,12 @@ import com.loopers.application.payment.LookupRetry;
 import com.loopers.application.payment.PaymentAttemptStarter;
 import com.loopers.application.payment.PaymentAttemptStarter.StartedPayment;
 import com.loopers.application.payment.PaymentGateway;
-import com.loopers.application.payment.PaymentGatewayUnavailableException;
+import com.loopers.application.payment.PaymentReconciler;
 import com.loopers.application.payment.PaymentResultApplier;
 import com.loopers.domain.order.Order;
 import com.loopers.domain.order.OrderService;
+import com.loopers.domain.payment.PaymentAttempt;
 import com.loopers.domain.payment.PaymentAttemptRepository;
-import com.loopers.domain.payment.PaymentObservation;
 import com.loopers.domain.product.ProductModel;
 import com.loopers.domain.product.ProductService;
 import com.loopers.support.error.CoreException;
@@ -37,6 +37,8 @@ public class OrderFacade {
     private final ProductService productService;
     private final PaymentAttemptStarter paymentAttemptStarter;
     private final PaymentResultApplier paymentResultApplier;
+    private final PaymentReconciler paymentReconciler;
+    private final OrderInfoAssembler orderInfoAssembler;
     private final PaymentGateway paymentGateway;
     private final PaymentAttemptRepository paymentAttemptRepository;
 
@@ -103,31 +105,30 @@ public class OrderFacade {
             case CreateResult.RejectedNoEffect rejected -> paymentResultApplier.rejectBeforeCreate(payment.orderId());
             case CreateResult.Unknown unknown -> {
                 paymentResultApplier.recordUnknown(payment.orderId());
-                lookUpImmediately(payment);
+                // 응답만 잃은 경우(ⓐ)를 고객이 기다리는 동안 짧게 확인한다(D-028). 키를 모르므로 주문 식별자로 목록 조회한다.
+                paymentReconciler.reconcile(payment.orderId(), payment.providerOrderId(), null, LookupRetry.IMMEDIATE);
             }
         }
     }
 
     /**
-     * 응답만 잃은 경우(ⓐ)를 고객이 기다리는 동안 짧게 확인한다(D-028, recovery.md 2번). 키를 모르므로 주문 식별자로 목록 조회한다.
-     * 한 건일 때만 반영한다. 0건·물어보지 못함은 실패의 증거가 아니라 UNKNOWN 그대로 두고(INV-004), 2건 이상은 고르지 않는다(D-010).
+     * 고객 결제 확인 — 이미 시작한 결제의 기존 거래를 PG에 물어 반영한다. 새 결제를 만들지 않는다(pg-contract.md 6번).
+     * - 결제 시도가 없는 주문(DRAFT, 이전 POINT 결제)은 409다(D-039). 남의 주문은 404다.
+     * - 이미 종결됐으면 PG를 부르지 않고 저장된 상태를 돌려준다(D-037).
+     * - 조회가 실패해도 상태를 바꾸지 않고 저장된 상태를 돌려준다(D-038, INV-004).
      */
-    private void lookUpImmediately(StartedPayment payment) {
-        List<PaymentObservation> observations;
-        try {
-            observations = paymentGateway.findByProviderOrderId(payment.providerOrderId(), LookupRetry.IMMEDIATE);
-        } catch (PaymentGatewayUnavailableException e) {
-            return;
+    public OrderInfo reconcilePayment(Long orderId, Long requesterId) {
+        orderService.getOwnedOrder(orderId, requesterId);
+        PaymentAttempt attempt = paymentAttemptRepository.findByOrderId(orderId)
+            .orElseThrow(() -> new CoreException(ErrorType.CONFLICT, "결제를 시작하지 않은 주문입니다."));
+        if (!attempt.getStatus().isTerminal()) {
+            paymentReconciler.reconcile(orderId, attempt.getProviderOrderId(), attempt.getTransactionKey(), LookupRetry.CUSTOMER);
         }
-        if (observations.size() == 1) {
-            paymentResultApplier.apply(payment.orderId(), observations.get(0));
-        }
+        return getMyOrder(orderId, requesterId);
     }
 
     public List<OrderInfo> getMyOrders(Long requesterId) {
-        return orderService.getMyOrders(requesterId).stream()
-            .map(OrderInfo::from)
-            .toList();
+        return orderInfoAssembler.withPayments(orderService.getMyOrders(requesterId));
     }
 
     public OrderInfo getMyOrder(Long orderId, Long requesterId) {

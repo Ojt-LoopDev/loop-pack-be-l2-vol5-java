@@ -13,14 +13,13 @@ import java.util.List;
 public class OrderAdminFacade {
 
     private final OrderService orderService;
+    private final OrderInfoAssembler orderInfoAssembler;
 
     public List<OrderInfo> getOrders() {
-        return orderService.getOrders().stream()
-            .map(OrderInfo::from)
-            .toList();
+        return orderInfoAssembler.withPayments(orderService.getOrders());
     }
 
     public OrderInfo getOrder(Long orderId) {
-        return OrderInfo.from(orderService.getOrder(orderId));
+        return orderInfoAssembler.withPayments(List.of(orderService.getOrder(orderId))).get(0);
     }
 }
