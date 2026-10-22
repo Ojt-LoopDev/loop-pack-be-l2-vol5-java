@@ -91,8 +91,8 @@ public class PaymentRecoveryJob {
             .toList();
         for (Candidate candidate : ordered) {
             PaymentAttempt attempt = candidate.attempt();
-            if (attempt.getStatus().isTerminal()) {
-                // 이미 다른 입구(고객 reconcile 등)가 끝냈다 — 다시 물을 필요가 없다.
+            if (attempt.getStatus().isTerminal() && !attempt.isWatched(now)) {
+                // 이미 다른 입구(고객 reconcile 등)가 끝냈다 — 다시 물을 필요가 없다. 감시 중인 시도(D-013)는 계속 묻는다.
                 paymentCallbackInboxService.markDone(candidate.inboxIds(), attempt.getId(), now);
                 continue;
             }

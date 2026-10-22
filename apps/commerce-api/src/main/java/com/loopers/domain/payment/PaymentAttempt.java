@@ -48,6 +48,8 @@ public class PaymentAttempt extends BaseEntity {
     static final Duration FOURTH_EMPTY_INTERVAL = Duration.ofMinutes(30);
     static final Duration LONG_EMPTY_INTERVAL = Duration.ofHours(1);
     public static final int REVIEW_THRESHOLD = 3;
+    static final Duration WATCH_PERIOD = Duration.ofDays(3);
+    static final Duration WATCH_INTERVAL = Duration.ofHours(6);
 
     private Long orderId;
     private String attemptKey;
@@ -64,6 +66,11 @@ public class PaymentAttempt extends BaseEntity {
     private int emptyLookupCount;
     private ZonedDateTime nextCheckAt;
     private ZonedDateTime reviewRequestedAt;
+
+    // 관리자 실패 처리(D-009)와 그 뒤의 감시(D-013).
+    private String resolvedBy;
+    private ZonedDateTime resolvedAt;
+    private ZonedDateTime watchUntil;
 
     protected PaymentAttempt() {}
 
@@ -194,6 +201,37 @@ public class PaymentAttempt extends BaseEntity {
     }
 
     /**
+     * 관리자가 PG에 거래가 없음을 직접 확인하고 실패로 처리한다(D-009). 누가·언제 처리했는지 남기고, 사람의 판단이 틀렸을 때를 대비해
+     * 3일 동안 6시간마다 계속 조회한다(감시, D-013). 늦게 나타난 SUCCESS는 상태를 바꾸지 않고 충돌로 기록된다(INV-003).
+     * 거래 키를 모르는 미종결 시도만 허용한다 — 처리중은 PG가 거래를 만들었다고 이미 답했으므로 사람이 덮어쓰지 않는다(D-045).
+     */
+    public ApplyResult failByAdmin(String resolvedBy, ZonedDateTime now) {
+        if (resolvedBy == null || resolvedBy.isBlank()) {
+            throw new CoreException(ErrorType.BAD_REQUEST, "처리자는 비어있을 수 없습니다.");
+        }
+        if (status != PaymentAttemptStatus.REQUESTED && status != PaymentAttemptStatus.UNKNOWN) {
+            throw new CoreException(ErrorType.CONFLICT,
+                "거래 키를 모르는 미종결 결제만 관리자가 실패 처리할 수 있습니다. (현재: " + status + ")");
+        }
+        this.status = PaymentAttemptStatus.FAILED;
+        this.resolvedBy = resolvedBy;
+        this.resolvedAt = now;
+        this.watchUntil = now.plus(WATCH_PERIOD);
+        this.nextCheckAt = now.plus(WATCH_INTERVAL);
+        return ApplyResult.FAILED;
+    }
+
+    /** 관리자 실패 처리 뒤 감시 기간 안인가(D-013). 감시 중인 시도는 종결됐어도 회복 작업이 계속 조회한다. */
+    public boolean isWatched(ZonedDateTime now) {
+        return status == PaymentAttemptStatus.FAILED && watchUntil != null && !now.isAfter(watchUntil);
+    }
+
+    /** 감시 조회를 마쳤다 — 결과와 상관없이 6시간 뒤 다시 본다. 다른 결과는 반영 쪽이 충돌로 기록한다. */
+    public void recordWatchCheck(ZonedDateTime now) {
+        this.nextCheckAt = now.plus(WATCH_INTERVAL);
+    }
+
+    /**
      * 회복 작업의 조회가 0건이었다 — 거래가 없다는 증거는 아니지만(INV-004) 이어지면 덜 자주 묻는다(D-008).
      * 1~3번째는 3분, 4번째는 30분, 5번째부터 1시간 뒤에 다시 본다. 3번째에 관리자 확인을 요청한 시각을 한 번만 적는다(D-007, D-035).
      * 조회는 멈추지 않는다 — 관리자 목록에 올라도 계속 확인한다.
@@ -258,6 +296,18 @@ public class PaymentAttempt extends BaseEntity {
 
     public ZonedDateTime getReviewRequestedAt() {
         return reviewRequestedAt;
+    }
+
+    public String getResolvedBy() {
+        return resolvedBy;
+    }
+
+    public ZonedDateTime getResolvedAt() {
+        return resolvedAt;
+    }
+
+    public ZonedDateTime getWatchUntil() {
+        return watchUntil;
     }
 
     public ZonedDateTime getSendStartedAt() {

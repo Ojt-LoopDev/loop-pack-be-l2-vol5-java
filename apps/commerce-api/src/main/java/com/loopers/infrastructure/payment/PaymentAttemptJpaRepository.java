@@ -26,8 +26,11 @@ public interface PaymentAttemptJpaRepository extends JpaRepository<PaymentAttemp
 
     List<PaymentAttempt> findAllByOrderIdIn(Collection<Long> orderIds);
 
-    @Query("SELECT a FROM PaymentAttempt a WHERE a.status IN :statuses AND a.nextCheckAt <= :now ORDER BY a.sendStartedAt ASC, a.id ASC")
-    List<PaymentAttempt> findDueForCheck(@Param("statuses") Collection<PaymentAttemptStatus> statuses,
+    @Query("SELECT a FROM PaymentAttempt a WHERE a.nextCheckAt <= :now"
+        + " AND (a.status IN :unfinished OR (a.status = :watched AND a.watchUntil >= :now))"
+        + " ORDER BY a.sendStartedAt ASC, a.id ASC")
+    List<PaymentAttempt> findDueForCheck(@Param("unfinished") Collection<PaymentAttemptStatus> unfinished,
+                                         @Param("watched") PaymentAttemptStatus watched,
                                          @Param("now") ZonedDateTime now, Pageable pageable);
 
     Optional<PaymentAttempt> findByProviderOrderId(String providerOrderId);

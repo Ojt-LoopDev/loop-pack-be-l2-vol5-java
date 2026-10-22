@@ -451,4 +451,81 @@ class PaymentAttemptTest {
             );
         }
     }
+
+    @DisplayName("관리자 실패 처리는, (D-009, D-013, D-045)")
+    @Nested
+    class AdminFail {
+        private final ZonedDateTime now = ZonedDateTime.parse("2026-10-23T10:00:00+09:00");
+
+        @DisplayName("거래 키를 모르는 미종결 시도(요청됨·UNKNOWN)를 FAILED로 종결하고, 처리자·시각을 남기며 3일 감시를 6시간 뒤부터 시작한다.")
+        @Test
+        void failsUnknown_andStartsWatch() {
+            // arrange
+            PaymentAttempt attempt = requested();
+            attempt.markUnknown();
+
+            // act
+            ApplyResult result = attempt.failByAdmin("admin", now);
+
+            // assert
+            assertAll(
+                () -> assertThat(result).isEqualTo(ApplyResult.FAILED),
+                () -> assertThat(attempt.getStatus()).isEqualTo(PaymentAttemptStatus.FAILED),
+                () -> assertThat(attempt.getResolvedBy()).isEqualTo("admin"),
+                () -> assertThat(attempt.getResolvedAt()).isEqualTo(now),
+                () -> assertThat(attempt.getWatchUntil()).isEqualTo(now.plusDays(3)),
+                () -> assertThat(attempt.getNextCheckAt()).isEqualTo(now.plusHours(6)),
+                () -> assertThat(attempt.isWatched(now.plusDays(3))).isTrue(),
+                () -> assertThat(attempt.isWatched(now.plusDays(3).plusSeconds(1))).isFalse()
+            );
+        }
+
+        @DisplayName("요청됨 상태도 실패 처리할 수 있다 — 발송 도중 서버가 죽은 흔적이다(D-018).")
+        @Test
+        void failsRequested() {
+            PaymentAttempt attempt = requested();
+            assertThat(attempt.failByAdmin("admin", now)).isEqualTo(ApplyResult.FAILED);
+        }
+
+        @DisplayName("처리중(PG가 거래를 만들었다고 답함)이나 종결된 시도는 CONFLICT다.")
+        @Test
+        void rejectsPendingAndTerminal() {
+            PaymentAttempt pending = requested();
+            pending.accept(TX_KEY);
+            PaymentAttempt failed = requested();
+            failed.rejectBeforeCreate();
+
+            CoreException onPending = assertThrows(CoreException.class, () -> pending.failByAdmin("admin", now));
+            CoreException onFailed = assertThrows(CoreException.class, () -> failed.failByAdmin("admin", now));
+
+            assertAll(
+                () -> assertThat(onPending.getErrorType()).isEqualTo(ErrorType.CONFLICT),
+                () -> assertThat(onFailed.getErrorType()).isEqualTo(ErrorType.CONFLICT),
+                () -> assertThat(pending.getStatus()).isEqualTo(PaymentAttemptStatus.PENDING)
+            );
+        }
+
+        @DisplayName("처리자가 비어 있으면 BAD_REQUEST다.")
+        @Test
+        void rejectsBlankResolver() {
+            CoreException exception = assertThrows(CoreException.class, () -> requested().failByAdmin(" ", now));
+            assertThat(exception.getErrorType()).isEqualTo(ErrorType.BAD_REQUEST);
+        }
+
+        @DisplayName("감시 조회를 마치면 결과와 상관없이 6시간 뒤 다시 본다. 관리자가 처리하지 않은 종결 시도는 감시 대상이 아니다.")
+        @Test
+        void schedulesNextWatchCheck() {
+            PaymentAttempt attempt = requested();
+            attempt.failByAdmin("admin", now);
+            PaymentAttempt rejected = requested();
+            rejected.rejectBeforeCreate();
+
+            attempt.recordWatchCheck(now.plusHours(6));
+
+            assertAll(
+                () -> assertThat(attempt.getNextCheckAt()).isEqualTo(now.plusHours(12)),
+                () -> assertThat(rejected.isWatched(now)).isFalse()
+            );
+        }
+    }
 }

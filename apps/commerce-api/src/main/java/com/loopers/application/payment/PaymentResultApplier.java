@@ -56,6 +56,17 @@ public class PaymentResultApplier {
         return result;
     }
 
+    /**
+     * 관리자가 PG에 거래가 없음을 확인하고 실패로 처리한다(D-009, D-045). 다른 실패 반영과 같이 주문 실패·예약 반환을
+     * 같은 트랜잭션에서 하고(INV-001), 감시를 시작한다(D-013).
+     */
+    @Transactional
+    public void failByAdmin(Long orderId, String resolvedBy, ZonedDateTime now) {
+        Locked locked = lock(orderId);
+        ApplyResult result = locked.attempt().failByAdmin(resolvedBy, now);
+        applyEffect(locked.order(), locked.attempt(), result);
+    }
+
     /** 같은 주문 식별자로 거래가 2건 이상 조회됐다 — 자동으로 고르지 않고 상태를 그대로 둔 채 기록한다(D-010). */
     @Transactional
     public void recordMultipleTransactions(Long orderId) {
@@ -92,6 +103,13 @@ public class PaymentResultApplier {
     @Transactional
     public void recordLookup(Long orderId, PaymentReconciler.Outcome outcome, ZonedDateTime now) {
         PaymentAttempt attempt = lock(orderId).attempt();
+        if (attempt.getStatus().isTerminal()) {
+            // 감시 중인 종결 시도(D-013) — 0건 횟수와 상관없이 6시간 뒤 다시 본다.
+            if (attempt.isWatched(now)) {
+                attempt.recordWatchCheck(now);
+            }
+            return;
+        }
         switch (outcome) {
             case NOT_FOUND -> attempt.recordEmptyLookup(now);
             case APPLIED, MULTIPLE_TRANSACTIONS -> attempt.recordFound(now);

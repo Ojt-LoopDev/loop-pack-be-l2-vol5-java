@@ -51,7 +51,7 @@ public class PaymentAttemptRepositoryImpl implements PaymentAttemptRepository {
 
     @Override
     public List<PaymentAttempt> findDueForCheck(ZonedDateTime now, int limit) {
-        return paymentAttemptJpaRepository.findDueForCheck(UNFINISHED, now, PageRequest.of(0, limit));
+        return paymentAttemptJpaRepository.findDueForCheck(UNFINISHED, PaymentAttemptStatus.FAILED, now, PageRequest.of(0, limit));
     }
 
     @Override
