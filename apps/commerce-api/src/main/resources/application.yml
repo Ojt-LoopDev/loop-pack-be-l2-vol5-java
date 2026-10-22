@@ -43,6 +43,12 @@ pg:
     read-timeout: 1s
     retry-initial-wait: 100ms  # 재조회 사이 대기 100ms → 200ms (D-028)
 
+# 결제 회복 작업 — 수신함과 미종결 결제를 같은 작업으로 처리한다 (docs/week5/design.md D-040~D-042)
+payment:
+  recovery:
+    enabled: true
+    interval: PT3M   # 회차 간격이자 수신함 재시도 간격 (recovery.md 3번)
+
 springdoc:
   use-fqn: true
   swagger-ui:

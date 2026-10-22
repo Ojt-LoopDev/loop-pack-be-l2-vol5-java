@@ -17,7 +17,9 @@ public class TestPgInitializer implements ApplicationContextInitializer<Configur
             "pg.base-url=" + TestPg.baseUrl(),
             "pg.create.read-timeout=500ms",
             "pg.lookup.read-timeout=300ms",
-            "pg.lookup.retry-initial-wait=10ms"
+            "pg.lookup.retry-initial-wait=10ms",
+            // 백그라운드 회복 작업이 테스트 데이터를 같이 처리하지 않게 끈다 — 테스트는 PaymentRecoveryJob을 직접 부른다.
+            "payment.recovery.enabled=false"
         ).applyTo(applicationContext);
     }
 }
