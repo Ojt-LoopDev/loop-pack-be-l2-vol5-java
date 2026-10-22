@@ -6,6 +6,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.time.ZonedDateTime;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -369,6 +371,83 @@ class PaymentAttemptTest {
             assertAll(
                 () -> assertThat(otherKey.getErrorType()).isEqualTo(ErrorType.CONFLICT),
                 () -> assertThat(otherOrder.getErrorType()).isEqualTo(ErrorType.BAD_REQUEST)
+            );
+        }
+    }
+
+    @DisplayName("회복 작업의 확인 일정은, (D-007, D-008, D-043, D-044)")
+    @Nested
+    class CheckSchedule {
+        private final ZonedDateTime now = ZonedDateTime.parse("2026-10-22T10:00:00+09:00");
+
+        @DisplayName("처음에는 발송 시작 1분 뒤부터 확인 대상이 된다 — 정상 callback을 기다려 준다.")
+        @Test
+        void firstCheckIsOneMinuteAfterSending() {
+            PaymentAttempt attempt = requested();
+            assertThat(attempt.getNextCheckAt()).isEqualTo(attempt.getSendStartedAt().plusMinutes(1));
+        }
+
+        @DisplayName("0건이 이어지면 1~3번째는 3분, 4번째는 30분, 5번째부터 1시간 뒤에 다시 보고, 3번째에 관리자 확인 요청 시각을 한 번만 적는다.")
+        @Test
+        void backsOff_andRequestsReviewOnThirdEmptyLookup() {
+            PaymentAttempt attempt = requested();
+
+            attempt.recordEmptyLookup(now);
+            attempt.recordEmptyLookup(now);
+            assertAll(
+                () -> assertThat(attempt.getEmptyLookupCount()).isEqualTo(2),
+                () -> assertThat(attempt.getNextCheckAt()).isEqualTo(now.plusMinutes(3)),
+                () -> assertThat(attempt.getReviewRequestedAt()).isNull()
+            );
+
+            attempt.recordEmptyLookup(now);
+            assertAll(
+                () -> assertThat(attempt.getNextCheckAt()).isEqualTo(now.plusMinutes(3)),
+                () -> assertThat(attempt.getReviewRequestedAt()).isEqualTo(now)
+            );
+
+            ZonedDateTime later = now.plusMinutes(3);
+            attempt.recordEmptyLookup(later);
+            assertAll(
+                () -> assertThat(attempt.getNextCheckAt()).isEqualTo(later.plusMinutes(30)),
+                () -> assertThat(attempt.getReviewRequestedAt()).isEqualTo(now)
+            );
+
+            attempt.recordEmptyLookup(later);
+            attempt.recordEmptyLookup(later);
+            assertAll(
+                () -> assertThat(attempt.getEmptyLookupCount()).isEqualTo(6),
+                () -> assertThat(attempt.getNextCheckAt()).isEqualTo(later.plusHours(1)),
+                () -> assertThat(attempt.getReviewRequestedAt()).isEqualTo(now)
+            );
+        }
+
+        @DisplayName("거래를 보면 연속 0건이 끊기고 3분 뒤 다시 본다.")
+        @Test
+        void resetsCount_whenTransactionIsFound() {
+            PaymentAttempt attempt = requested();
+            attempt.recordEmptyLookup(now);
+            attempt.recordEmptyLookup(now);
+
+            attempt.recordFound(now);
+
+            assertAll(
+                () -> assertThat(attempt.getEmptyLookupCount()).isZero(),
+                () -> assertThat(attempt.getNextCheckAt()).isEqualTo(now.plusMinutes(3))
+            );
+        }
+
+        @DisplayName("물어보지 못했으면 0건으로 세지 않고 3분 뒤 다시 본다. (INV-004)")
+        @Test
+        void keepsCount_whenLookupIsUnavailable() {
+            PaymentAttempt attempt = requested();
+            attempt.recordEmptyLookup(now);
+
+            attempt.recordUnavailable(now.plusMinutes(3));
+
+            assertAll(
+                () -> assertThat(attempt.getEmptyLookupCount()).isEqualTo(1),
+                () -> assertThat(attempt.getNextCheckAt()).isEqualTo(now.plusMinutes(6))
             );
         }
     }

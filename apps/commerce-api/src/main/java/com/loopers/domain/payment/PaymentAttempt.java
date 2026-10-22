@@ -10,6 +10,7 @@ import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
 
+import java.time.Duration;
 import java.time.ZonedDateTime;
 
 /**
@@ -35,10 +36,18 @@ import java.time.ZonedDateTime;
     },
     indexes = {
         @Index(name = "idx_payment_attempt_provider_order_id", columnList = "provider_order_id"),
-        @Index(name = "idx_payment_attempt_transaction_key", columnList = "transaction_key")
+        @Index(name = "idx_payment_attempt_transaction_key", columnList = "transaction_key"),
+        // 회복 작업이 "다음 확인 시각이 지난 미종결 시도"를 찾는 경로다(D-041).
+        @Index(name = "idx_payment_attempt_status_next_check_at", columnList = "status, next_check_at")
     }
 )
 public class PaymentAttempt extends BaseEntity {
+
+    static final Duration FIRST_CHECK_DELAY = Duration.ofMinutes(1);
+    static final Duration CHECK_INTERVAL = Duration.ofMinutes(3);
+    static final Duration FOURTH_EMPTY_INTERVAL = Duration.ofMinutes(30);
+    static final Duration LONG_EMPTY_INTERVAL = Duration.ofHours(1);
+    public static final int REVIEW_THRESHOLD = 3;
 
     private Long orderId;
     private String attemptKey;
@@ -50,6 +59,11 @@ public class PaymentAttempt extends BaseEntity {
 
     private Long amount;
     private ZonedDateTime sendStartedAt;
+
+    // 회복 작업의 확인 일정(docs/week5/design.md D-007, D-008, D-043, D-044, recovery.md 3번).
+    private int emptyLookupCount;
+    private ZonedDateTime nextCheckAt;
+    private ZonedDateTime reviewRequestedAt;
 
     protected PaymentAttempt() {}
 
@@ -72,6 +86,8 @@ public class PaymentAttempt extends BaseEntity {
         this.amount = amount;
         this.status = PaymentAttemptStatus.REQUESTED;
         this.sendStartedAt = ZonedDateTime.now();
+        // 대상 기준 시간 — 정상 callback을 기다려 준 뒤에 회복 작업이 본다. 오래 남은 요청됨(D-018)도 이 기준으로 대상이 된다.
+        this.nextCheckAt = sendStartedAt.plus(FIRST_CHECK_DELAY);
     }
 
     /**
@@ -177,6 +193,37 @@ public class PaymentAttempt extends BaseEntity {
             || (status == PaymentAttemptStatus.FAILED && observed == PaymentObservation.Status.FAILED);
     }
 
+    /**
+     * 회복 작업의 조회가 0건이었다 — 거래가 없다는 증거는 아니지만(INV-004) 이어지면 덜 자주 묻는다(D-008).
+     * 1~3번째는 3분, 4번째는 30분, 5번째부터 1시간 뒤에 다시 본다. 3번째에 관리자 확인을 요청한 시각을 한 번만 적는다(D-007, D-035).
+     * 조회는 멈추지 않는다 — 관리자 목록에 올라도 계속 확인한다.
+     */
+    public void recordEmptyLookup(ZonedDateTime now) {
+        this.emptyLookupCount++;
+        if (emptyLookupCount == REVIEW_THRESHOLD && reviewRequestedAt == null) {
+            this.reviewRequestedAt = now;
+        }
+        this.nextCheckAt = now.plus(emptyLookupInterval());
+    }
+
+    private Duration emptyLookupInterval() {
+        if (emptyLookupCount <= REVIEW_THRESHOLD) {
+            return CHECK_INTERVAL;
+        }
+        return emptyLookupCount == REVIEW_THRESHOLD + 1 ? FOURTH_EMPTY_INTERVAL : LONG_EMPTY_INTERVAL;
+    }
+
+    /** 회복 작업의 조회로 거래를 봤다 — 연속 0건이 끊긴다. 아직 미종결이면 다음 회차에 다시 본다. */
+    public void recordFound(ZonedDateTime now) {
+        this.emptyLookupCount = 0;
+        this.nextCheckAt = now.plus(CHECK_INTERVAL);
+    }
+
+    /** 물어보지 못했다(timeout·5xx·회로 OPEN) — 0건이 아니므로 횟수를 바꾸지 않고 다음 회차에 다시 본다(D-044). */
+    public void recordUnavailable(ZonedDateTime now) {
+        this.nextCheckAt = now.plus(CHECK_INTERVAL);
+    }
+
     public Long getOrderId() {
         return orderId;
     }
@@ -199,6 +246,18 @@ public class PaymentAttempt extends BaseEntity {
 
     public long getAmount() {
         return amount;
+    }
+
+    public int getEmptyLookupCount() {
+        return emptyLookupCount;
+    }
+
+    public ZonedDateTime getNextCheckAt() {
+        return nextCheckAt;
+    }
+
+    public ZonedDateTime getReviewRequestedAt() {
+        return reviewRequestedAt;
     }
 
     public ZonedDateTime getSendStartedAt() {

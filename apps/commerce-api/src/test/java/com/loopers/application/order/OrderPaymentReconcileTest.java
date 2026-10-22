@@ -19,6 +19,7 @@ import com.loopers.support.error.CoreException;
 import com.loopers.support.error.ErrorType;
 import com.loopers.support.pg.TestPg;
 import com.loopers.utils.DatabaseCleanUp;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -82,6 +83,9 @@ class OrderPaymentReconcileTest {
 
     @Autowired
     private OrderJpaRepository orderJpaRepository;
+
+    @Autowired
+    private CircuitBreaker pgLookupCircuitBreaker;
 
     @Autowired
     private DatabaseCleanUp databaseCleanUp;
@@ -236,6 +240,22 @@ class OrderPaymentReconcileTest {
                 () -> assertThat(info.payment().status()).isEqualTo(PaymentAttemptStatus.PENDING),
                 () -> assertThat(stockOf(fixture.productIds().get(0))).isEqualTo(INITIAL_STOCK - QUANTITY)
             );
+        }
+
+        @DisplayName("조회 회로가 열려 있으면 PG를 부르지 않고, 상태를 바꾸지 않은 채 저장된 상태를 돌려준다. (D-029, D-038)")
+        @Test
+        void keepsState_whenCircuitIsOpen() {
+            // arrange
+            Fixture fixture = pending(1);
+            stubSingle(fixture, 200, transactionJson(fixture, fixture.transactionKey(), AMOUNT, "SUCCESS"));
+            pgLookupCircuitBreaker.transitionToOpenState();
+
+            // act
+            OrderInfo info = orderFacade.reconcilePayment(fixture.orderId(), fixture.userId());
+
+            // assert
+            assertThat(info.payment().status()).isEqualTo(PaymentAttemptStatus.PENDING);
+            pg.verify(exactly(0), getRequestedFor(urlPathMatching(TestPg.PAYMENTS_PATH + ".*")));
         }
 
         @DisplayName("조회가 실패하면 상태를 바꾸지 않고, 고객 경로의 정한 횟수(3회)까지만 조회한다. (D-038)")

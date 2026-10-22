@@ -19,13 +19,14 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * 결제 회복 작업 한 회차 — 수신함과 (7단계에서) 미종결 결제를 같은 작업으로 처리한다(docs/week5/design.md D-040).
+ * 결제 회복 작업 한 회차 — 수신함과 미종결 결제를 같은 작업으로 처리한다(docs/week5/design.md D-040).
  * 트랜잭션이 없다. 조회는 트랜잭션 밖, 반영은 TX B, 수신함 상태 기록은 짧은 TX다.
  *
  * - 처리 단위는 결제 시도다. 같은 시도의 callback 여러 통은 한 번만 조회한다(D-041).
  * - 발송 시작이 오래된 시도부터, 한 회차에 PG 조회 최대 {@link #MAX_LOOKUPS_PER_RUN}건(D-034).
  * - 시도는 수신함 본문의 키로 찾지만, PG 조회는 저장된 시도의 키로 한다 — 본문을 믿지 않는다.
  * - 조회 실패는 다음 회차에 다시, 세 번째 실패에서 포기한다(D-042). 이 경로는 조회를 재시도하지 않는다(D-028).
+ * - 조회할 때마다 시도의 다음 확인 일정을 적는다 — 0건이면 간격을 늘리고, 물어보지 못했으면 3분 뒤 다시(D-043, D-044).
  */
 @Slf4j
 @Component
@@ -39,6 +40,7 @@ public class PaymentRecoveryJob {
     private final PaymentCallbackInboxService paymentCallbackInboxService;
     private final PaymentAttemptRepository paymentAttemptRepository;
     private final PaymentReconciler paymentReconciler;
+    private final PaymentResultApplier paymentResultApplier;
     private final Duration interval;
 
     public PaymentRecoveryJob(
@@ -46,12 +48,14 @@ public class PaymentRecoveryJob {
         PaymentCallbackInboxService paymentCallbackInboxService,
         PaymentAttemptRepository paymentAttemptRepository,
         PaymentReconciler paymentReconciler,
+        PaymentResultApplier paymentResultApplier,
         @Value("${payment.recovery.interval:PT3M}") Duration interval
     ) {
         this.paymentCallbackInboxRepository = paymentCallbackInboxRepository;
         this.paymentCallbackInboxService = paymentCallbackInboxService;
         this.paymentAttemptRepository = paymentAttemptRepository;
         this.paymentReconciler = paymentReconciler;
+        this.paymentResultApplier = paymentResultApplier;
         this.interval = interval;
     }
 
@@ -74,6 +78,10 @@ public class PaymentRecoveryJob {
         }
         if (!unmatched.isEmpty()) {
             paymentCallbackInboxService.markUnmatched(unmatched, now);
+        }
+        // 다음 확인 시각이 지난 미종결 시도. callback이 온 시도와 겹치면 하나로 합친다(D-041).
+        for (PaymentAttempt attempt : paymentAttemptRepository.findDueForCheck(now, maxLookups)) {
+            candidates.computeIfAbsent(attempt.getId(), id -> new Candidate(attempt, new ArrayList<>()));
         }
 
         int lookups = 0;
@@ -109,6 +117,7 @@ public class PaymentRecoveryJob {
                 e.getClass().getSimpleName(), now, now.plus(interval));
             return;
         }
+        paymentResultApplier.recordLookup(attempt.getOrderId(), outcome, now);
         if (outcome == PaymentReconciler.Outcome.UNAVAILABLE) {
             paymentCallbackInboxService.markFailed(candidate.inboxIds(), attempt.getId(), "PG 조회 실패", now, now.plus(interval));
             return;

@@ -42,6 +42,12 @@ pg:
     connect-timeout: 1s
     read-timeout: 1s
     retry-initial-wait: 100ms  # 재조회 사이 대기 100ms → 200ms (D-028)
+    circuit-breaker:           # 조회 경로에만 (D-029, recovery.md 4번) — 측정 전 임시값
+      sliding-window-size: 20
+      minimum-number-of-calls: 20
+      failure-rate-threshold: 50
+      wait-duration-in-open-state: 30s
+      permitted-calls-in-half-open-state: 3
 
 # 결제 회복 작업 — 수신함과 미종결 결제를 같은 작업으로 처리한다 (docs/week5/design.md D-040~D-042)
 payment:

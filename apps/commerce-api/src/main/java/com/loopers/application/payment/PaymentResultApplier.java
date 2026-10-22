@@ -20,6 +20,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.ZonedDateTime;
 import java.util.Comparator;
 import java.util.Optional;
 
@@ -82,6 +83,20 @@ public class PaymentResultApplier {
                 attempt.getProviderOrderId(), transactionKey, PaymentObservation.Status.PENDING, attempt.getAmount()));
         }
         return result;
+    }
+
+    /**
+     * 회복 작업의 조회 결과로 다음 확인 일정을 적는다(D-043, D-044). 고객 경로는 부르지 않는다 — 0건 횟수는 회복 작업만 센다.
+     * 결과 반영(apply)과 별개의 짧은 트랜잭션이다. 같은 락 순서(주문 → 시도)를 따른다.
+     */
+    @Transactional
+    public void recordLookup(Long orderId, PaymentReconciler.Outcome outcome, ZonedDateTime now) {
+        PaymentAttempt attempt = lock(orderId).attempt();
+        switch (outcome) {
+            case NOT_FOUND -> attempt.recordEmptyLookup(now);
+            case APPLIED, MULTIPLE_TRANSACTIONS -> attempt.recordFound(now);
+            case UNAVAILABLE -> attempt.recordUnavailable(now);
+        }
     }
 
     /** create 응답을 받지 못했다 — 실패가 아니라 "모른다"(INV-004). */

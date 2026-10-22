@@ -7,6 +7,7 @@ import com.loopers.application.order.OrderFacade;
 import com.loopers.application.order.OrderItemRequest;
 import com.loopers.domain.order.OrderStatus;
 import com.loopers.domain.payment.CallbackInboxStatus;
+import com.loopers.domain.payment.PaymentAttempt;
 import com.loopers.domain.payment.PaymentAttemptRepository;
 import com.loopers.domain.payment.PaymentAttemptStatus;
 import com.loopers.domain.payment.PaymentCallbackInbox;
@@ -316,9 +317,15 @@ class PaymentRecoveryJobTest {
                     .isEqualTo(PaymentAttemptStatus.PENDING)
             );
 
-            // 포기한 행은 더 꺼내지 않는다
+            // 포기한 행은 더 꺼내지 않지만, 그 결제는 미종결 결제로서 스케줄러가 계속 확인한다(D-021)
+            stubLookup(fixture, 200, "SUCCESS");
             paymentRecoveryJob.runOnce(first.plusMinutes(30));
-            assertThat(lookupsOf(fixture)).isEqualTo(3);
+            assertAll(
+                () -> assertThat(inbox().get(0).getStatus()).isEqualTo(CallbackInboxStatus.GAVE_UP),
+                () -> assertThat(inbox().get(0).getTryCount()).isEqualTo(3),
+                () -> assertThat(lookupsOf(fixture)).isEqualTo(4),
+                () -> assertThat(orderStatus(fixture)).isEqualTo(OrderStatus.CONFIRMED)
+            );
         }
     }
 
@@ -352,6 +359,124 @@ class PaymentRecoveryJobTest {
             List<LoggedRequest> lookups = pg.findAll(getRequestedFor(urlPathMatching(TestPg.PAYMENTS_PATH + "/.*")));
             assertThat(lookups).extracting(LoggedRequest::getUrl)
                 .containsExactly(TestPg.PAYMENTS_PATH + "/" + older.transactionKey(), TestPg.PAYMENTS_PATH + "/" + newer.transactionKey());
+        }
+    }
+
+    @DisplayName("callback이 없어도, (D-006, D-041, D-043)")
+    @Nested
+    class DueAttempts {
+        private PaymentAttempt attemptOf(Fixture fixture) {
+            return paymentAttemptRepository.findByOrderId(fixture.orderId()).orElseThrow();
+        }
+
+        @DisplayName("발송 1분이 지나 다음 확인 시각이 된 미종결 결제를 조회해 확정한다. 1분이 안 됐으면 건너뛴다.")
+        @Test
+        void looksUpUnfinishedPayment_afterFirstCheckDelay() {
+            // arrange
+            Fixture fixture = pending();
+            stubLookup(fixture, 200, "SUCCESS");
+            ZonedDateTime sentAt = attemptOf(fixture).getSendStartedAt();
+
+            // act & assert — 아직 1분이 안 됐다
+            paymentRecoveryJob.runOnce(sentAt.plusSeconds(30));
+            assertThat(lookupsOf(fixture)).isZero();
+
+            // 1분이 지났다
+            paymentRecoveryJob.runOnce(sentAt.plusMinutes(1).plusSeconds(1));
+            assertAll(
+                () -> assertThat(lookupsOf(fixture)).isEqualTo(1),
+                () -> assertThat(orderStatus(fixture)).isEqualTo(OrderStatus.CONFIRMED)
+            );
+        }
+
+        @DisplayName("조회가 0건이면 횟수를 세고 3분 뒤로 미루며, 세 번째 0건에 관리자 확인 요청 시각을 적고 네 번째부터 간격을 늘린다. 결제와 재고는 그대로다.")
+        @Test
+        void countsEmptyLookups_andBacksOff() {
+            // arrange
+            Fixture fixture = pending();
+            stubLookup(fixture, 404, null);
+            ZonedDateTime t = attemptOf(fixture).getNextCheckAt().plusSeconds(1);
+
+            // act
+            paymentRecoveryJob.runOnce(t);
+            paymentRecoveryJob.runOnce(t.plusMinutes(3));
+            paymentRecoveryJob.runOnce(t.plusMinutes(6));
+            PaymentAttempt third = attemptOf(fixture);
+            paymentRecoveryJob.runOnce(t.plusMinutes(9));
+            PaymentAttempt fourth = attemptOf(fixture);
+
+            // assert
+            assertAll(
+                () -> assertThat(third.getEmptyLookupCount()).isEqualTo(3),
+                () -> assertThat(third.getReviewRequestedAt()).isNotNull(),
+                () -> assertThat(fourth.getEmptyLookupCount()).isEqualTo(4),
+                () -> assertThat(fourth.getNextCheckAt()).isAfter(t.plusMinutes(9).plusMinutes(29)),
+                () -> assertThat(fourth.getStatus()).isEqualTo(PaymentAttemptStatus.PENDING),
+                () -> assertThat(stockOf(fixture)).isEqualTo(INITIAL_STOCK - QUANTITY),
+                () -> assertThat(lookupsOf(fixture)).isEqualTo(4)
+            );
+        }
+
+        @DisplayName("조회에 실패하면 0건으로 세지 않고 3분 뒤 다시 본다. (D-044)")
+        @Test
+        void doesNotCountUnavailableAsEmpty() {
+            // arrange
+            Fixture fixture = pending();
+            stubLookup(fixture, 500, null);
+            ZonedDateTime t = attemptOf(fixture).getNextCheckAt().plusSeconds(1);
+
+            // act
+            paymentRecoveryJob.runOnce(t);
+
+            // assert
+            PaymentAttempt attempt = attemptOf(fixture);
+            assertAll(
+                () -> assertThat(attempt.getEmptyLookupCount()).isZero(),
+                () -> assertThat(attempt.getNextCheckAt().truncatedTo(ChronoUnit.SECONDS))
+                    .isEqualTo(t.plusMinutes(3).truncatedTo(ChronoUnit.SECONDS))
+            );
+        }
+
+        @DisplayName("고객 reconcile의 0건은 세지 않는다 — 회복 작업의 조회만 센다. (D-043)")
+        @Test
+        void customerReconcileDoesNotCount() {
+            // arrange
+            Fixture fixture = pending();
+            stubLookup(fixture, 404, null);
+
+            // act
+            orderFacade.reconcilePayment(fixture.orderId(), fixture.userId());
+            orderFacade.reconcilePayment(fixture.orderId(), fixture.userId());
+            orderFacade.reconcilePayment(fixture.orderId(), fixture.userId());
+
+            // assert
+            assertAll(
+                () -> assertThat(attemptOf(fixture).getEmptyLookupCount()).isZero(),
+                () -> assertThat(attemptOf(fixture).getReviewRequestedAt()).isNull()
+            );
+        }
+
+        @DisplayName("callback이 온 결제와 확인 시각이 된 결제가 같으면 한 번만 조회하고, 상한은 둘을 합쳐 적용한다.")
+        @Test
+        void mergesCandidates_andSharesLimit() {
+            // arrange
+            Fixture older = pending();
+            Fixture newer = pending();
+            callback(older, "SUCCESS");
+            stubLookup(older, 200, "SUCCESS");
+            stubLookup(newer, 200, "SUCCESS");
+            ZonedDateTime t = attemptOf(newer).getNextCheckAt().plusSeconds(1);
+
+            // act — 두 결제 모두 확인 시각이 지났고, older에는 callback도 있다. 상한 1건.
+            paymentRecoveryJob.runOnce(t, 1);
+
+            // assert
+            assertAll(
+                () -> assertThat(lookupsOf(older)).isEqualTo(1),
+                () -> assertThat(lookupsOf(newer)).isZero(),
+                () -> assertThat(orderStatus(older)).isEqualTo(OrderStatus.CONFIRMED),
+                () -> assertThat(inbox().get(0).getStatus()).isEqualTo(CallbackInboxStatus.DONE)
+            );
         }
     }
 }

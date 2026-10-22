@@ -1,5 +1,6 @@
 package com.loopers.domain.payment;
 
+import java.time.ZonedDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -20,6 +21,9 @@ public interface PaymentAttemptRepository {
 
     /** 주문 목록에 결제 정보를 붙일 때 한 번에 읽는다(주문마다 따로 읽지 않는다). */
     List<PaymentAttempt> findAllByOrderIdIn(Collection<Long> orderIds);
+
+    /** 회복 작업 대상 — 미종결이고 다음 확인 시각이 지난 시도를 발송 시작이 오래된 순으로(D-034, D-041). 잠그지 않는다. */
+    List<PaymentAttempt> findDueForCheck(ZonedDateTime now, int limit);
 
     /**
      * 잠그지 않고 읽는다 — callback 워커가 주문 번호(orderId)를 알아낼 때 쓴다. orderId는 생성 뒤 바뀌지 않으므로

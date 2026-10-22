@@ -10,6 +10,8 @@ import com.loopers.application.payment.CreateResult;
 import com.loopers.application.payment.LookupRetry;
 import com.loopers.application.payment.PaymentGatewayUnavailableException;
 import com.loopers.domain.payment.PaymentObservation;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -68,7 +70,7 @@ class PgPaymentGatewayContractTest {
     private static PgPaymentGateway gatewayFor(String baseUrl) {
         PgClientSettings settings = new PgClientSettings(baseUrl, "135135", CALLBACK_URL,
             Duration.ofMillis(300), CREATE_READ_TIMEOUT, Duration.ofMillis(300), LOOKUP_READ_TIMEOUT, Duration.ofMillis(10));
-        return new PgPaymentGateway(settings, new ObjectMapper());
+        return new PgPaymentGateway(settings, new ObjectMapper(), CircuitBreaker.ofDefaults("contract-test"));
     }
 
     private static CreatePaymentRequest request() {
@@ -335,6 +337,128 @@ class PgPaymentGatewayContractTest {
             // act & assert
             assertThrows(PaymentGatewayUnavailableException.class,
                 () -> gateway.findByTransactionKey(TX_KEY, LookupRetry.NONE));
+        }
+    }
+
+    /**
+     * 조회 circuit breaker(D-029). 운영 수치가 아니라 동작을 본다 — 작은 값(창 4, 최소 표본 4, 실패율 50%, OPEN 300ms, 탐색 1건)으로 전이를 확인한다.
+     */
+    @DisplayName("조회 circuit breaker는, ")
+    @Nested
+    class LookupCircuitBreaker {
+        private CircuitBreaker circuitBreaker;
+        private PgPaymentGateway guarded;
+
+        @BeforeEach
+        void setUp() {
+            circuitBreaker = CircuitBreaker.of("test", CircuitBreakerConfig.custom()
+                .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+                .slidingWindowSize(4)
+                .minimumNumberOfCalls(4)
+                .failureRateThreshold(50)
+                .waitDurationInOpenState(Duration.ofMillis(300))
+                .permittedNumberOfCallsInHalfOpenState(1)
+                .recordExceptions(PaymentGatewayUnavailableException.class)
+                .build());
+            PgClientSettings settings = new PgClientSettings(pg.baseUrl(), "135135", CALLBACK_URL,
+                Duration.ofMillis(300), CREATE_READ_TIMEOUT, Duration.ofMillis(300), LOOKUP_READ_TIMEOUT, Duration.ofMillis(10));
+            guarded = new PgPaymentGateway(settings, new ObjectMapper(), circuitBreaker);
+        }
+
+        private void failLookups(int times) {
+            for (int i = 0; i < times; i++) {
+                assertThrows(PaymentGatewayUnavailableException.class, () -> guarded.findByTransactionKey(TX_KEY, LookupRetry.NONE));
+            }
+        }
+
+        @DisplayName("물어보지 못한 조회가 최소 표본만큼 쌓여 실패율을 넘으면 열리고, 열린 동안은 PG를 부르지 않고 \"물어보지 못함\"을 돌려준다.")
+        @Test
+        void opens_andStopsCallingPg() {
+            // arrange
+            pg.stubFor(get(urlEqualTo("/api/v1/payments/" + TX_KEY)).willReturn(aResponse().withStatus(500)));
+            failLookups(4);
+            pg.resetRequests();
+
+            // act
+            assertThrows(PaymentGatewayUnavailableException.class, () -> guarded.findByTransactionKey(TX_KEY, LookupRetry.CUSTOMER));
+
+            // assert
+            assertThat(circuitBreaker.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+            pg.verify(exactly(0), getRequestedFor(urlEqualTo("/api/v1/payments/" + TX_KEY)));
+        }
+
+        @DisplayName("404와 빈 목록은 정상 응답이라 아무리 쌓여도 열리지 않는다.")
+        @Test
+        void staysClosed_forNotFoundAndEmptyList() {
+            // arrange
+            pg.stubFor(get(urlEqualTo("/api/v1/payments/" + TX_KEY)).willReturn(aResponse().withStatus(404)));
+            pg.stubFor(get(urlPathEqualTo("/api/v1/payments")).willReturn(aResponse().withStatus(200)
+                .withHeader("Content-Type", "application/json").withBody("[]")));
+
+            // act
+            for (int i = 0; i < 5; i++) {
+                assertThat(guarded.findByTransactionKey(TX_KEY, LookupRetry.NONE)).isEmpty();
+                assertThat(guarded.findByProviderOrderId(PROVIDER_ORDER_ID, LookupRetry.NONE)).isEmpty();
+            }
+
+            // assert
+            assertThat(circuitBreaker.getState()).isEqualTo(CircuitBreaker.State.CLOSED);
+        }
+
+        @DisplayName("재시도까지 끝난 조회 한 번이 표본 하나다 — 고객 경로 3회 재시도 실패 3번(HTTP 9번)으로는 최소 표본(4)에 닿지 않는다.")
+        @Test
+        void countsRetriedLookupAsOneSample() {
+            // arrange
+            pg.stubFor(get(urlEqualTo("/api/v1/payments/" + TX_KEY)).willReturn(aResponse().withStatus(500)));
+
+            // act
+            for (int i = 0; i < 3; i++) {
+                assertThrows(PaymentGatewayUnavailableException.class, () -> guarded.findByTransactionKey(TX_KEY, LookupRetry.CUSTOMER));
+            }
+
+            // assert
+            assertAll(
+                () -> assertThat(circuitBreaker.getMetrics().getNumberOfFailedCalls()).isEqualTo(3),
+                () -> assertThat(circuitBreaker.getState()).isEqualTo(CircuitBreaker.State.CLOSED)
+            );
+            pg.verify(exactly(9), getRequestedFor(urlEqualTo("/api/v1/payments/" + TX_KEY)));
+        }
+
+        @DisplayName("열린 뒤 대기 시간이 지나면 탐색 조회를 한 번 보내고, 성공하면 다시 닫힌다.")
+        @Test
+        void halfOpensAfterWait_andClosesOnSuccess() throws InterruptedException {
+            // arrange
+            pg.stubFor(get(urlEqualTo("/api/v1/payments/" + TX_KEY)).willReturn(aResponse().withStatus(500)));
+            failLookups(4);
+            assertThat(circuitBreaker.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+            pg.stubFor(get(urlEqualTo("/api/v1/payments/" + TX_KEY)).willReturn(aResponse().withStatus(200)
+                .withHeader("Content-Type", "application/json").withBody(transactionJson("SUCCESS"))));
+            TimeUnit.MILLISECONDS.sleep(400);
+
+            // act
+            Optional<PaymentObservation> probe = guarded.findByTransactionKey(TX_KEY, LookupRetry.NONE);
+
+            // assert
+            assertAll(
+                () -> assertThat(probe).isPresent(),
+                () -> assertThat(circuitBreaker.getState()).isEqualTo(CircuitBreaker.State.CLOSED)
+            );
+        }
+
+        @DisplayName("열려 있어도 거래 생성(create)은 막지 않는다 — circuit breaker는 조회 경로에만 건다.")
+        @Test
+        void doesNotGuardCreate() {
+            // arrange
+            circuitBreaker.transitionToOpenState();
+            pg.stubFor(post(urlEqualTo("/api/v1/payments")).willReturn(aResponse().withStatus(202)
+                .withHeader("Content-Type", "application/json").withBody(transactionJson("PENDING"))));
+
+            // act
+            CreateResult result = guarded.create(request());
+
+            // assert
+            assertThat(result).isEqualTo(new CreateResult.Accepted(TX_KEY));
+            pg.verify(exactly(1), postRequestedFor(urlEqualTo("/api/v1/payments")));
         }
     }
 }

@@ -8,6 +8,8 @@ import com.loopers.application.payment.LookupRetry;
 import com.loopers.application.payment.PaymentGateway;
 import com.loopers.application.payment.PaymentGatewayUnavailableException;
 import com.loopers.domain.payment.PaymentObservation;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.core.IntervalFunction;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
@@ -36,7 +38,8 @@ import java.util.function.Supplier;
  *
  * - create는 재시도하지 않는다. 하위 JDK HttpClient도 멱등하지 않은 요청을 기본으로 다시 보내지 않는다(INV-005, D-030).
  * - create 응답은 정확한 조건의 422만 효과 0건으로 보고, 나머지는 timeout을 포함해 전부 UNKNOWN이다(INV-004, D-025).
- * - 조회 재시도는 경로별 횟수(LookupRetry)만큼 이 안에서 한다. circuit breaker는 나중에 이 바깥을 감싼다(D-028, D-029).
+ * - 조회 재시도는 경로별 횟수(LookupRetry)만큼 이 안에서 한다. circuit breaker가 그 바깥을 감싼다 — 재시도까지 끝난 조회 한 번이
+ *   표본 하나다. 회로가 열려 있으면 PG를 부르지 않고 "물어보지 못함"으로 돌려준다(D-028, D-029). create에는 걸지 않는다.
  * - 요청·응답 본문을 로그에 남기지 않는다 — 카드 번호가 들어 있다.
  */
 @Component
@@ -52,6 +55,7 @@ public class PgPaymentGateway implements PaymentGateway {
     private final RestClient createClient;
     private final RestClient lookupClient;
     private final Map<LookupRetry, Retry> retries = new EnumMap<>(LookupRetry.class);
+    private final CircuitBreaker lookupCircuitBreaker;
 
     @Autowired
     public PgPaymentGateway(
@@ -63,15 +67,17 @@ public class PgPaymentGateway implements PaymentGateway {
         @Value("${pg.create.read-timeout:2s}") Duration createReadTimeout,
         @Value("${pg.lookup.connect-timeout:1s}") Duration lookupConnectTimeout,
         @Value("${pg.lookup.read-timeout:1s}") Duration lookupReadTimeout,
-        @Value("${pg.lookup.retry-initial-wait:100ms}") Duration lookupRetryInitialWait
+        @Value("${pg.lookup.retry-initial-wait:100ms}") Duration lookupRetryInitialWait,
+        CircuitBreaker pgLookupCircuitBreaker
     ) {
         this(new PgClientSettings(baseUrl, userId, callbackUrl, createConnectTimeout, createReadTimeout,
-            lookupConnectTimeout, lookupReadTimeout, lookupRetryInitialWait), objectMapper);
+            lookupConnectTimeout, lookupReadTimeout, lookupRetryInitialWait), objectMapper, pgLookupCircuitBreaker);
     }
 
-    PgPaymentGateway(PgClientSettings settings, ObjectMapper objectMapper) {
+    PgPaymentGateway(PgClientSettings settings, ObjectMapper objectMapper, CircuitBreaker lookupCircuitBreaker) {
         this.settings = settings;
         this.objectMapper = objectMapper;
+        this.lookupCircuitBreaker = lookupCircuitBreaker;
         this.createClient = restClient(settings.baseUrl(), settings.createConnectTimeout(), settings.createReadTimeout());
         this.lookupClient = restClient(settings.baseUrl(), settings.lookupConnectTimeout(), settings.lookupReadTimeout());
         for (LookupRetry policy : LookupRetry.values()) {
@@ -175,7 +181,13 @@ public class PgPaymentGateway implements PaymentGateway {
     }
 
     private <T> T withRetry(LookupRetry policy, Supplier<T> call) {
-        return retries.get(policy).executeSupplier(call);
+        Supplier<T> retried = Retry.decorateSupplier(retries.get(policy), call);
+        try {
+            return lookupCircuitBreaker.executeSupplier(retried);
+        } catch (CallNotPermittedException e) {
+            // 회로가 열려 PG를 부르지 않았다 — "거래 없음"이 아니라 "물어보지 못함"이다(INV-004).
+            throw new PaymentGatewayUnavailableException("PG 조회 회로 열림", e);
+        }
     }
 
     private static <T> T lookup(Supplier<T> call) {

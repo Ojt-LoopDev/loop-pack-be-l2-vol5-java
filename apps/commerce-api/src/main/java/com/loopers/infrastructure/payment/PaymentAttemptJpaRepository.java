@@ -1,12 +1,15 @@
 package com.loopers.infrastructure.payment;
 
 import com.loopers.domain.payment.PaymentAttempt;
+import com.loopers.domain.payment.PaymentAttemptStatus;
 import jakarta.persistence.LockModeType;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.ZonedDateTime;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -22,6 +25,10 @@ public interface PaymentAttemptJpaRepository extends JpaRepository<PaymentAttemp
     Optional<PaymentAttempt> findByAttemptKey(String attemptKey);
 
     List<PaymentAttempt> findAllByOrderIdIn(Collection<Long> orderIds);
+
+    @Query("SELECT a FROM PaymentAttempt a WHERE a.status IN :statuses AND a.nextCheckAt <= :now ORDER BY a.sendStartedAt ASC, a.id ASC")
+    List<PaymentAttempt> findDueForCheck(@Param("statuses") Collection<PaymentAttemptStatus> statuses,
+                                         @Param("now") ZonedDateTime now, Pageable pageable);
 
     Optional<PaymentAttempt> findByProviderOrderId(String providerOrderId);
 
