@@ -25,6 +25,7 @@ dependencies {
     // resilience (PG 조회 재시도·circuit breaker — 스타터·AOP 대신 adapter 안에서 직접 조립한다, docs/week5/design.md D-029)
     implementation("io.github.resilience4j:resilience4j-retry:2.3.0")
     implementation("io.github.resilience4j:resilience4j-circuitbreaker:2.3.0")
+    implementation("io.github.resilience4j:resilience4j-ratelimiter:2.3.0")
 
     // security (관리자 경로 인가)
     implementation("org.springframework.boot:spring-boot-starter-security")

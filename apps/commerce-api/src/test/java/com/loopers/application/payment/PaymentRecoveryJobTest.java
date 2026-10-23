@@ -11,6 +11,8 @@ import com.loopers.domain.payment.PaymentAttempt;
 import com.loopers.domain.payment.PaymentAttemptRepository;
 import com.loopers.domain.payment.PaymentAttemptStatus;
 import com.loopers.domain.payment.PaymentCallbackInbox;
+import com.loopers.domain.payment.PaymentCallbackInboxRepository;
+import com.loopers.domain.payment.PaymentCallbackInboxService;
 import com.loopers.domain.product.ProductModel;
 import com.loopers.domain.user.UserModel;
 import com.loopers.infrastructure.order.OrderJpaRepository;
@@ -26,8 +28,10 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
+import java.time.Duration;
 import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.List;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
@@ -476,6 +480,70 @@ class PaymentRecoveryJobTest {
                 () -> assertThat(lookupsOf(newer)).isZero(),
                 () -> assertThat(orderStatus(older)).isEqualTo(OrderStatus.CONFIRMED),
                 () -> assertThat(inbox().get(0).getStatus()).isEqualTo(CallbackInboxStatus.DONE)
+            );
+        }
+    }
+
+    @DisplayName("한 회차는, (D-047)")
+    @Nested
+    class Drain {
+        @Autowired
+        private PaymentCallbackInboxRepository paymentCallbackInboxRepository;
+
+        @Autowired
+        private PaymentCallbackInboxService paymentCallbackInboxService;
+
+        @Autowired
+        private PaymentReconciler paymentReconciler;
+
+        @Autowired
+        private PaymentResultApplier paymentResultApplier;
+
+        private PaymentRecoveryJob jobWith(int batchSize, int lookupsPerSecond) {
+            return new PaymentRecoveryJob(paymentCallbackInboxRepository, paymentCallbackInboxService, paymentAttemptRepository,
+                paymentReconciler, paymentResultApplier, Duration.ofMinutes(3), batchSize, lookupsPerSecond);
+        }
+
+        private List<Fixture> pendingWithCallbacks(int count) {
+            List<Fixture> fixtures = new ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                Fixture fixture = pending();
+                callback(fixture, "SUCCESS");
+                stubLookup(fixture, 200, "SUCCESS");
+                fixtures.add(fixture);
+            }
+            return fixtures;
+        }
+
+        @DisplayName("묶음 크기보다 많이 밀려 있어도 묶음을 반복해 한 회차에 모두 처리한다.")
+        @Test
+        void drainsMoreThanBatchSize() {
+            // arrange
+            List<Fixture> fixtures = pendingWithCallbacks(5);
+
+            // act — 묶음 2건
+            jobWith(2, 100).runOnce(now());
+
+            // assert
+            assertThat(fixtures).allSatisfy(fixture -> assertThat(orderStatus(fixture)).isEqualTo(OrderStatus.CONFIRMED));
+            assertThat(inbox()).extracting(PaymentCallbackInbox::getStatus).containsOnly(CallbackInboxStatus.DONE);
+        }
+
+        @DisplayName("PG 조회는 초당 상한을 넘지 않는다 — 초당 5건이면 12건 조회에 2초 가까이 걸린다.")
+        @Test
+        void limitsLookupsPerSecond() {
+            // arrange
+            List<Fixture> fixtures = pendingWithCallbacks(12);
+
+            // act
+            long started = System.nanoTime();
+            jobWith(100, 5).runOnce(now());
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
+
+            // assert — 첫 1초에 5건, 다음 1초에 5건, 그다음 초에 2건: 최소 2번의 기다림
+            assertAll(
+                () -> assertThat(elapsed).isGreaterThanOrEqualTo(Duration.ofMillis(1_500)),
+                () -> assertThat(fixtures).allSatisfy(fixture -> assertThat(orderStatus(fixture)).isEqualTo(OrderStatus.CONFIRMED))
             );
         }
     }

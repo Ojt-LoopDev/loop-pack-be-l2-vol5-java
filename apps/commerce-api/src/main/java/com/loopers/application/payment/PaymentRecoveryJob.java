@@ -5,7 +5,10 @@ import com.loopers.domain.payment.PaymentAttemptRepository;
 import com.loopers.domain.payment.PaymentCallbackInbox;
 import com.loopers.domain.payment.PaymentCallbackInboxRepository;
 import com.loopers.domain.payment.PaymentCallbackInboxService;
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterConfig;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -13,17 +16,21 @@ import java.time.Duration;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * 결제 회복 작업 한 회차 — 수신함과 미종결 결제를 같은 작업으로 처리한다(docs/week5/design.md D-040).
  * 트랜잭션이 없다. 조회는 트랜잭션 밖, 반영은 TX B, 수신함 상태 기록은 짧은 TX다.
  *
  * - 처리 단위는 결제 시도다. 같은 시도의 callback 여러 통은 한 번만 조회한다(D-041).
- * - 발송 시작이 오래된 시도부터, 한 회차에 PG 조회 최대 {@link #MAX_LOOKUPS_PER_RUN}건(D-034).
+ * - 한 회차는 처리할 차례인 시도가 남아 있는 동안 묶음(batch) 단위로 계속 처리한다. PG 조회는 초당 N건을 넘지 않는다(D-047).
+ *   상한을 회차당 건수로 걸면 깨어나는 순간 몰려가고 나머지 시간은 쉬어, PG 부담은 크고 처리량은 작다(부하 측정 단계 0).
+ * - 묶음마다 발송 시작이 오래된 시도부터 처리한다(D-034의 순서는 그대로).
  * - 시도는 수신함 본문의 키로 찾지만, PG 조회는 저장된 시도의 키로 한다 — 본문을 믿지 않는다.
  * - 조회 실패는 다음 회차에 다시, 세 번째 실패에서 포기한다(D-042). 이 경로는 조회를 재시도하지 않는다(D-028).
  * - 조회할 때마다 시도의 다음 확인 일정을 적는다 — 0건이면 간격을 늘리고, 물어보지 못했으면 3분 뒤 다시(D-043, D-044).
@@ -32,9 +39,8 @@ import java.util.Optional;
 @Component
 public class PaymentRecoveryJob {
 
-    public static final int MAX_LOOKUPS_PER_RUN = 100;
-    /** 한 회차에 읽는 수신함 행의 상한. 같은 시도의 callback이 겹칠 수 있어 조회 상한보다 넉넉하게 둔다. */
-    private static final int INBOX_SCAN_LIMIT = 500;
+    /** 한 묶음에 읽는 수신함 행의 상한. 같은 시도의 callback이 겹칠 수 있어 묶음 크기보다 넉넉하게 둔다. */
+    private static final int INBOX_SCAN_FACTOR = 5;
 
     private final PaymentCallbackInboxRepository paymentCallbackInboxRepository;
     private final PaymentCallbackInboxService paymentCallbackInboxService;
@@ -42,14 +48,19 @@ public class PaymentRecoveryJob {
     private final PaymentReconciler paymentReconciler;
     private final PaymentResultApplier paymentResultApplier;
     private final Duration interval;
+    private final int batchSize;
+    private final RateLimiter lookupRateLimiter;
 
+    @Autowired
     public PaymentRecoveryJob(
         PaymentCallbackInboxRepository paymentCallbackInboxRepository,
         PaymentCallbackInboxService paymentCallbackInboxService,
         PaymentAttemptRepository paymentAttemptRepository,
         PaymentReconciler paymentReconciler,
         PaymentResultApplier paymentResultApplier,
-        @Value("${payment.recovery.interval:PT3M}") Duration interval
+        @Value("${payment.recovery.interval:PT3M}") Duration interval,
+        @Value("${payment.recovery.batch-size:100}") int batchSize,
+        @Value("${payment.recovery.lookups-per-second:20}") int lookupsPerSecond
     ) {
         this.paymentCallbackInboxRepository = paymentCallbackInboxRepository;
         this.paymentCallbackInboxService = paymentCallbackInboxService;
@@ -57,20 +68,65 @@ public class PaymentRecoveryJob {
         this.paymentReconciler = paymentReconciler;
         this.paymentResultApplier = paymentResultApplier;
         this.interval = interval;
+        this.batchSize = batchSize;
+        // 1초 주기마다 허가 N개가 다시 채워지고(고정 주기), 조회 한 번에 하나를 쓴다. 다 쓰면 다음 주기까지 기다린다.
+        this.lookupRateLimiter = RateLimiter.of("pg-recovery-lookup", RateLimiterConfig.custom()
+            .limitForPeriod(lookupsPerSecond)
+            .limitRefreshPeriod(Duration.ofSeconds(1))
+            .timeoutDuration(Duration.ofSeconds(10))
+            .build());
     }
 
     public void runOnce(ZonedDateTime now) {
-        runOnce(now, MAX_LOOKUPS_PER_RUN);
+        runOnce(now, Integer.MAX_VALUE);
     }
 
-    /** 조회 상한을 바꿔 부를 수 있게 둔다 — 테스트가 상한 동작을 적은 건수로 확인한다. */
+    /**
+     * 처리할 차례인 시도가 없을 때까지 묶음 단위로 처리한다. 묶음의 "지금"은 회차 시작 시각에 흐른 시간을 더한 값이다 —
+     * 회차 도중에 들어온 callback도 같은 회차에서 처리된다.
+     * maxLookups는 테스트가 순서를 적은 건수로 확인하려고 둔 조회 수 상한이다.
+     */
     void runOnce(ZonedDateTime now, int maxLookups) {
+        long startedNanos = System.nanoTime();
+        Set<Long> processedThisRun = new HashSet<>();
+        int lookups = 0;
+        while (lookups < maxLookups) {
+            ZonedDateTime batchNow = now.plus(Duration.ofNanos(System.nanoTime() - startedNanos));
+            List<Candidate> batch = nextBatch(batchNow, processedThisRun);
+            if (batch.isEmpty()) {
+                return;
+            }
+            for (Candidate candidate : batch) {
+                PaymentAttempt attempt = candidate.attempt();
+                processedThisRun.add(attempt.getId());
+                if (attempt.getStatus().isTerminal() && !attempt.isWatched(batchNow)) {
+                    // 이미 다른 입구(고객 reconcile 등)가 끝냈다 — 다시 물을 필요가 없다. 감시 중인 시도(D-013)는 계속 묻는다.
+                    paymentCallbackInboxService.markDone(candidate.inboxIds(), attempt.getId(), batchNow);
+                    continue;
+                }
+                if (lookups >= maxLookups) {
+                    return;
+                }
+                lookups++;
+                process(candidate, batchNow);
+            }
+        }
+    }
+
+    /**
+     * 처리할 차례인 수신함 행의 시도와 다음 확인 시각이 지난 미종결 시도를 모아(같은 시도는 하나로, D-041) 오래된 순으로 돌려준다.
+     * 이번 회차에 이미 처리한 시도는 빼 — 기록이 실패해 계속 차례로 남는 시도가 회차를 끝나지 않게 만들지 않도록.
+     */
+    private List<Candidate> nextBatch(ZonedDateTime now, Set<Long> processedThisRun) {
         Map<Long, Candidate> candidates = new LinkedHashMap<>();
         List<Long> unmatched = new ArrayList<>();
-        for (PaymentCallbackInbox inbox : paymentCallbackInboxRepository.findDue(now, INBOX_SCAN_LIMIT)) {
+        for (PaymentCallbackInbox inbox : paymentCallbackInboxRepository.findDue(now, batchSize * INBOX_SCAN_FACTOR)) {
             Optional<PaymentAttempt> attempt = findAttempt(inbox);
             if (attempt.isEmpty()) {
                 unmatched.add(inbox.getId());
+                continue;
+            }
+            if (processedThisRun.contains(attempt.get().getId())) {
                 continue;
             }
             candidates.computeIfAbsent(attempt.get().getId(), id -> new Candidate(attempt.get(), new ArrayList<>()))
@@ -79,33 +135,24 @@ public class PaymentRecoveryJob {
         if (!unmatched.isEmpty()) {
             paymentCallbackInboxService.markUnmatched(unmatched, now);
         }
-        // 다음 확인 시각이 지난 미종결 시도. callback이 온 시도와 겹치면 하나로 합친다(D-041).
-        for (PaymentAttempt attempt : paymentAttemptRepository.findDueForCheck(now, maxLookups)) {
-            candidates.computeIfAbsent(attempt.getId(), id -> new Candidate(attempt, new ArrayList<>()));
+        for (PaymentAttempt attempt : paymentAttemptRepository.findDueForCheck(now, batchSize)) {
+            if (!processedThisRun.contains(attempt.getId())) {
+                candidates.computeIfAbsent(attempt.getId(), id -> new Candidate(attempt, new ArrayList<>()));
+            }
         }
-
-        int lookups = 0;
-        List<Candidate> ordered = candidates.values().stream()
+        return candidates.values().stream()
             .sorted(Comparator.comparing((Candidate candidate) -> candidate.attempt().getSendStartedAt())
                 .thenComparing(candidate -> candidate.attempt().getId()))
+            .limit(batchSize)
             .toList();
-        for (Candidate candidate : ordered) {
-            PaymentAttempt attempt = candidate.attempt();
-            if (attempt.getStatus().isTerminal() && !attempt.isWatched(now)) {
-                // 이미 다른 입구(고객 reconcile 등)가 끝냈다 — 다시 물을 필요가 없다. 감시 중인 시도(D-013)는 계속 묻는다.
-                paymentCallbackInboxService.markDone(candidate.inboxIds(), attempt.getId(), now);
-                continue;
-            }
-            if (lookups >= maxLookups) {
-                break;
-            }
-            lookups++;
-            process(candidate, now);
-        }
     }
 
     private void process(Candidate candidate, ZonedDateTime now) {
         PaymentAttempt attempt = candidate.attempt();
+        if (!lookupRateLimiter.acquirePermission()) {
+            // 정한 시간 안에 차례를 얻지 못했다 — 조회하지 않고 다음 회차로 넘긴다.
+            return;
+        }
         PaymentReconciler.Outcome outcome;
         try {
             outcome = paymentReconciler.reconcile(
