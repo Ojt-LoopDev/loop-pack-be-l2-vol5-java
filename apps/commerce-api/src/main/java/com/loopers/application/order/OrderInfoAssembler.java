@@ -13,7 +13,7 @@ import java.util.stream.Collectors;
 
 /**
  * 주문 목록에 결제 시도를 붙인다 — 고객·관리자 조회가 같이 쓴다. 결제 시도는 주문 id로 한 번에 읽는다(주문마다 따로 읽지 않는다).
- * 결제 시도가 없는 주문(DRAFT, 이전 POINT 결제)은 payment가 비어 있다(docs/week5/design.md 7번).
+ * 결제 시도가 없는 주문(DRAFT, 이전 POINT 결제)은 payment가 비어 있다(docs/week5/design.md 6번).
  */
 @RequiredArgsConstructor
 @Component

@@ -1,6 +1,7 @@
 package com.loopers.interfaces.api.order;
 
 import com.loopers.domain.brand.BrandModel;
+import com.loopers.domain.order.Order;
 import com.loopers.domain.product.ProductModel;
 import com.loopers.domain.user.UserModel;
 import com.loopers.domain.user.UserService;
@@ -586,6 +587,53 @@ class OrderV1ApiE2ETest {
     @DisplayName("GET /api/v1/orders/{orderId}")
     @Nested
     class GetMyOrder {
+        @DisplayName("이전에 포인트로 확정된 주문은 결제수단 POINT·결제액·확정 상태를 그대로 보여 주고, 결제 시도와 reconcile 경로는 없다.")
+        @Test
+        void showsPointOrderAsItWas() {
+            // arrange — 4주차까지의 확정 경로(포인트 결제)로 끝난 주문
+            ProductModel product = createProduct(1000L, 10);
+            Long userId = createUser();
+            Long orderId = createOrder(userId, List.of(new OrderV1Dto.CreateRequest.ItemRequest(product.getId(), 2)))
+                .getBody().data().id();
+            Order order = orderJpaRepository.findById(orderId).orElseThrow();
+            order.confirm(2000L);
+            orderJpaRepository.save(order);
+
+            // act
+            ResponseEntity<ApiResponse<OrderV1Dto.OrderResponse>> response =
+                testRestTemplate.exchange(ORDERS_URL + "/" + orderId, HttpMethod.GET, requestWithUser(userId), ORDER_RESPONSE_TYPE);
+
+            // assert
+            OrderV1Dto.OrderResponse data = response.getBody().data();
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(data.status().name()).isEqualTo("CONFIRMED");
+            assertThat(data.paymentMethod().name()).isEqualTo("POINT");
+            assertThat(data.paidAmount()).isEqualTo(2000L);
+            assertThat(data.items()).extracting(OrderV1Dto.ItemResponse::quantity).containsExactly(2);
+            assertThat(data.payment()).isNull();
+            assertThat(data.links().reconcile()).isNull();
+        }
+
+        @DisplayName("결제가 진행 중인 주문을 조회해도 PG를 부르지 않는다 — 조회는 저장된 상태만 보여 준다.")
+        @Test
+        void doesNotCallPg() {
+            // arrange
+            ProductModel product = createProduct(1000L, 10);
+            Long userId = createUser();
+            Long orderId = createOrder(userId, List.of(new OrderV1Dto.CreateRequest.ItemRequest(product.getId(), 1)))
+                .getBody().data().id();
+            confirmOrder(userId, orderId);
+            TestPg.server().resetRequests();
+
+            // act
+            ResponseEntity<ApiResponse<OrderV1Dto.OrderResponse>> response =
+                testRestTemplate.exchange(ORDERS_URL + "/" + orderId, HttpMethod.GET, requestWithUser(userId), ORDER_RESPONSE_TYPE);
+
+            // assert
+            assertThat(response.getBody().data().payment().status().name()).isEqualTo("PENDING");
+            assertThat(TestPg.server().getAllServeEvents()).isEmpty();
+        }
+
         @DisplayName("소유자가 조회하면, 200과 주문 상세를 반환한다.")
         @Test
         void returns200_whenOwnerRequests() {

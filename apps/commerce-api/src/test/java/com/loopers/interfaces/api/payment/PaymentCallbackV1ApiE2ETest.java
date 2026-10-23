@@ -155,6 +155,37 @@ class PaymentCallbackV1ApiE2ETest {
         assertThat(orderJpaRepository.findById(orderId).orElseThrow().getStatus()).isEqualTo(OrderStatus.CONFIRMED);
     }
 
+    @DisplayName("위조된 callback이 controller로 SUCCESS를 알려도, PG 조회가 처리중이면 주문은 확정되지 않는다 — 본문만으로 성공하지 않는다.")
+    @Test
+    void forgedSuccessCallback_doesNotConfirmOrder() {
+        // arrange — 결제는 PG에서 아직 처리중(PENDING)이다
+        Long userId = userJpaRepository.save(new UserModel()).getId();
+        Long productId = productJpaRepository.save(new ProductModel("상품", 3_000L, 1L, 10)).getId();
+        Long orderId = testRestTemplate.exchange("/api/v1/orders", HttpMethod.POST,
+            jsonWithUser(userId, Map.of("items", List.of(Map.of("productId", productId, "quantity", 1)))), ORDER_RESPONSE_TYPE)
+            .getBody().data().id();
+        testRestTemplate.exchange("/api/v1/orders/" + orderId + "/confirm", HttpMethod.POST,
+            jsonWithUser(userId, Map.of("paymentAttemptKey", "key-1", "cardType", "TEST", "cardNo", "0000-0000-0000-0000")),
+            ORDER_RESPONSE_TYPE);
+        String providerOrderId = String.format("LP-ORD-%010d", orderId);
+        String transactionKey = TestPg.transactionKeyOf(providerOrderId);
+        TestPg.server().stubFor(get(urlPathMatching(TestPg.PAYMENTS_PATH + "/" + transactionKey))
+            .willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json")
+                .withBody("{\"transactionKey\":\"" + transactionKey + "\",\"orderId\":\"" + providerOrderId
+                    + "\",\"amount\":3000,\"status\":\"PENDING\"}")));
+
+        // act — 누군가 SUCCESS라고 알린다
+        ResponseEntity<ApiResponse<Object>> response = postCallback("{\"transactionKey\":\"" + transactionKey
+            + "\",\"providerOrderId\":\"" + providerOrderId + "\",\"status\":\"SUCCESS\"}");
+        paymentRecoveryJob.runOnce(ZonedDateTime.now().plusSeconds(1));
+
+        // assert — 받기는 했지만(200) 확정은 PG 조회 결과(PENDING)를 따른다
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(orderJpaRepository.findById(orderId).orElseThrow().getStatus()).isEqualTo(OrderStatus.PAYMENT_PENDING);
+        assertThat(paymentCallbackInboxJpaRepository.findAll()).extracting(PaymentCallbackInbox::getStatus)
+            .containsExactly(CallbackInboxStatus.DONE);
+    }
+
     private HttpEntity<Object> jsonWithUser(Long userId, Object body) {
         HttpHeaders headers = new HttpHeaders();
         headers.add("X-USER-ID", String.valueOf(userId));

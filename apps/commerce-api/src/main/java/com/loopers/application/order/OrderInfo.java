@@ -23,7 +23,7 @@ public record OrderInfo(
     ZonedDateTime confirmedAt,
     ZonedDateTime createdAt
 ) {
-    /** 결제 시도가 없는 주문(DRAFT, 이전 POINT 확정 주문) — payment가 비어 있다(docs/week5/design.md 7번). */
+    /** 결제 시도가 없는 주문(DRAFT, 이전 POINT 확정 주문) — payment가 비어 있다(docs/week5/design.md 6번). */
     public static OrderInfo from(Order order) {
         return from(order, null);
     }

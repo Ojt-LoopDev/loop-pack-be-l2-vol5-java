@@ -69,7 +69,7 @@ public class OrderV1Controller implements OrderV1ApiSpec {
         return paymentResponse(orderFacade.reconcilePayment(orderId, userId));
     }
 
-    // 결제가 아직 끝나지 않았어도 요청은 정상으로 받아들였다 — 202에도 meta.result는 SUCCESS다(docs/week5/design.md 7번).
+    // 결제가 아직 끝나지 않았어도 요청은 정상으로 받아들였다 — 202에도 meta.result는 SUCCESS다(docs/week5/design.md 6번).
     private static ResponseEntity<ApiResponse<OrderV1Dto.OrderResponse>> paymentResponse(OrderInfo info) {
         HttpStatus status = OrderV1Dto.OrderResponse.paymentInProgress(info) ? HttpStatus.ACCEPTED : HttpStatus.OK;
         return ResponseEntity.status(status).body(ApiResponse.success(OrderV1Dto.OrderResponse.from(info)));

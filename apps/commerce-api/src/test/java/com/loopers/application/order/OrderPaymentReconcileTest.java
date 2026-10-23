@@ -11,6 +11,7 @@ import com.loopers.domain.payment.PaymentConflictReason;
 import com.loopers.domain.payment.PaymentConflictRepository;
 import com.loopers.domain.payment.PaymentObservation;
 import com.loopers.domain.product.ProductModel;
+import com.loopers.domain.product.ProductService;
 import com.loopers.domain.user.UserModel;
 import com.loopers.infrastructure.order.OrderJpaRepository;
 import com.loopers.infrastructure.product.ProductJpaRepository;
@@ -74,6 +75,9 @@ class OrderPaymentReconcileTest {
 
     @Autowired
     private PaymentConflictRepository paymentConflictRepository;
+
+    @Autowired
+    private ProductService productService;
 
     @Autowired
     private ProductJpaRepository productJpaRepository;
@@ -430,6 +434,20 @@ class OrderPaymentReconcileTest {
                 () -> assertThat(deletedAfter.getDeletedAt()).isNotNull(),
                 () -> assertThat(stockOf(aliveId)).isEqualTo(INITIAL_STOCK)
             );
+        }
+
+        @DisplayName("결제 대기 중에 관리자가 가용 재고를 다시 설정했다면, 실패 반영은 설정값 위에 예약분만 더한다. (INV-006, design.md 6번)")
+        @Test
+        void returnsReservationOnTopOfAdminSetting() {
+            // arrange — 재고 10에서 2를 확보(가용 8), 그 사이 관리자가 가용 재고를 5로 설정
+            Fixture fixture = pending(1);
+            productService.changeStock(fixture.productIds().get(0), 5);
+
+            // act
+            paymentResultApplier.apply(fixture.orderId(), observation(fixture, PaymentObservation.Status.FAILED));
+
+            // assert — 10으로 되돌리는 게 아니라 5 + 2
+            assertThat(stockOf(fixture.productIds().get(0))).isEqualTo(5 + QUANTITY);
         }
 
         @DisplayName("같은 FAILED가 먼저 반영된 뒤 다시 들어오면(callback과 reconcile이 겹침) 재고를 두 번 돌려주지 않는다. (INV-002)")
