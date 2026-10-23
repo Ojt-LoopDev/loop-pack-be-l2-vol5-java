@@ -82,33 +82,34 @@ public class PaymentRecoveryJob {
     }
 
     /**
-     * 처리할 차례인 시도가 없을 때까지 묶음 단위로 처리한다. 묶음의 "지금"은 회차 시작 시각에 흐른 시간을 더한 값이다 —
-     * 회차 도중에 들어온 callback도 같은 회차에서 처리된다.
+     * 회차를 시작한 시각에 처리할 차례였던 시도가 없을 때까지 묶음 단위로 처리한다.
+     * "차례인가"를 판단하는 시각도, 다음 확인 시각을 적는 기준도 회차 시작 시각 하나다 — 이 회차에서 실패해 미뤄진 시도(시작 + 3분)는
+     * 같은 회차에 다시 차례가 되지 않는다. 묶음마다 시각이 흐르게 두면 회차가 재시도 간격보다 길어질 때 먼저 실패한 행이 다시 차례가 돼
+     * 수신함 읽기 창을 채우고, 뒤쪽 시도는 한 번도 조회되지 않았다(부하 측정 단계 3). 길어진 회차 뒤에는 다음 회차가 미뤄진 시도를 곧바로 집는다.
+     * 회차 도중 들어온 callback은 다음 회차가 맡는다(D-040).
      * maxLookups는 테스트가 순서를 적은 건수로 확인하려고 둔 조회 수 상한이다.
      */
     void runOnce(ZonedDateTime now, int maxLookups) {
-        long startedNanos = System.nanoTime();
         Set<Long> processedThisRun = new HashSet<>();
         int lookups = 0;
         while (lookups < maxLookups) {
-            ZonedDateTime batchNow = now.plus(Duration.ofNanos(System.nanoTime() - startedNanos));
-            List<Candidate> batch = nextBatch(batchNow, processedThisRun);
+            List<Candidate> batch = nextBatch(now, processedThisRun);
             if (batch.isEmpty()) {
                 return;
             }
             for (Candidate candidate : batch) {
                 PaymentAttempt attempt = candidate.attempt();
                 processedThisRun.add(attempt.getId());
-                if (attempt.getStatus().isTerminal() && !attempt.isWatched(batchNow)) {
+                if (attempt.getStatus().isTerminal() && !attempt.isWatched(now)) {
                     // 이미 다른 입구(고객 reconcile 등)가 끝냈다 — 다시 물을 필요가 없다. 감시 중인 시도(D-013)는 계속 묻는다.
-                    paymentCallbackInboxService.markDone(candidate.inboxIds(), attempt.getId(), batchNow);
+                    paymentCallbackInboxService.markDone(candidate.inboxIds(), attempt.getId(), now);
                     continue;
                 }
                 if (lookups >= maxLookups) {
                     return;
                 }
                 lookups++;
-                process(candidate, batchNow);
+                process(candidate, now);
             }
         }
     }

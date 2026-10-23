@@ -529,6 +529,31 @@ class PaymentRecoveryJobTest {
             assertThat(inbox()).extracting(PaymentCallbackInbox::getStatus).containsOnly(CallbackInboxStatus.DONE);
         }
 
+        @DisplayName("회차 도중 실패한 결제가 다시 차례가 돼도 회차 시작 때 차례였던 결제는 모두 한 번씩 조회한다 — 뒤쪽 결제가 굶지 않는다.")
+        @Test
+        void doesNotStarveLaterPayments_whenFailedOnesBecomeDueAgainWithinRun() {
+            // arrange — 조회가 모두 실패하고, 재시도 간격을 1ms로 줄여 실패한 행이 같은 회차 안에서 곧 다시 차례가 되게 한다
+            //   (부하 측정 단계 3: 회차가 3분보다 길어지자 먼저 실패한 행이 다시 차례가 돼 수신함 읽기 창을 채웠고, 뒤쪽 2,360건이 조회되지 않았다)
+            List<Fixture> fixtures = new ArrayList<>();
+            for (int i = 0; i < 12; i++) {
+                Fixture fixture = pending();
+                callback(fixture, "SUCCESS");
+                stubLookup(fixture, 500, null);
+                fixtures.add(fixture);
+            }
+            PaymentRecoveryJob job = new PaymentRecoveryJob(paymentCallbackInboxRepository, paymentCallbackInboxService,
+                paymentAttemptRepository, paymentReconciler, paymentResultApplier, Duration.ofMillis(1), 2, 1_000);
+
+            // act
+            job.runOnce(now());
+
+            // assert
+            assertAll(
+                () -> assertThat(fixtures).allSatisfy(fixture -> assertThat(lookupsOf(fixture)).isEqualTo(1)),
+                () -> assertThat(inbox()).extracting(PaymentCallbackInbox::getStatus).containsOnly(CallbackInboxStatus.RETRY)
+            );
+        }
+
         @DisplayName("PG 조회는 초당 상한을 넘지 않는다 — 초당 5건이면 12건 조회에 2초 가까이 걸린다.")
         @Test
         void limitsLookupsPerSecond() {
