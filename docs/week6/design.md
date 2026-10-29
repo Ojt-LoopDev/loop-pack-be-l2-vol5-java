@@ -155,6 +155,7 @@ productId는 과거 사실의 식별자로 보존한다. 상품 행의 존재나
 
 **구현 기반**
 - [D-23](decisions.md) 발행 executor 1스레드·큐 1000·넘치면 기록하고 버림, `max.block.ms` 5초 · [D-24](decisions.md) 테스트·검사 기반 · [D-25](decisions.md) 전용 String producer, 시각 소수 6자리 고정 · [D-26](decisions.md) commit 전 발행 준비 실패는 확정 유지 + 미발행 Counter
+- [D-27](decisions.md) 정규 형식 문자열 · [D-28](decisions.md) 락 대기 단축은 테스트만 · [D-29](decisions.md) 모르는 예외는 멈춤 · [D-30](decisions.md) conflict·계약 깨짐 Counter
 
 ## 9. 실험
 
