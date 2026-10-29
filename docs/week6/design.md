@@ -13,7 +13,7 @@ PG로 확정된 주문을 `OrderConfirmed` 이벤트로 Kafka에 보내고, comm
   - 검증된 PG SUCCESS를 처음 CONFIRMED로 반영한 commit 뒤에만 `OrderConfirmed`를 직접 발행한다. 발행 실패는 주문을 되돌리지 않는다.
   - commerce-streamer의 실제 consumer가 구매 활동을 저장한다. 재전달돼도 한 번만 남기고, 같은 사실과 충돌을 구분한다.
   - listener는 record 단위, concurrency 1, `MANUAL_IMMEDIATE`, `CommonContainerStoppingErrorHandler`다. 실패 기록을 처리 완료로 건너뛰지 않는다.
-  - 실험: partition 배정 1→2→3, DB commit 뒤 미커밋 offset 재전달, 실제 listener 실패와 재시작, 누락 구간 재현.
+  - 실험: partition 2개에서 같은 group의 consumer를 1→2→3개로 늘릴 때의 배정, DB commit 뒤 미커밋 offset 재전달, 실제 listener 실패와 재시작, 누락 구간 재현.
 - **이번 주에 하지 않는 것**: Outbox(7주차), 랭킹 API(9주차), 이전 POINT 확정 주문의 소급 발행, 멈춘 consumer의 자동 재시작(D-20), DLT(D-9).
 
 ## 2. 이벤트 계약
