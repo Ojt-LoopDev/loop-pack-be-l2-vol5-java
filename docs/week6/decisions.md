@@ -218,10 +218,15 @@
   - 관찰값: 전달 2회, 같은 topic·partition·offset, 구매 활동 행 수·수량 불변, committed offset n → n → n+1. position이나 로그로 판정하지 않고 group의 committed offset을 admin으로 읽는다.
   - commit 값은 "다음에 읽을 위치"다. Spring `MANUAL_IMMEDIATE`의 `ack.acknowledge()`도 position이 아니라 그 기록의 `offset() + 1`을 지정해 commit한다(spring-kafka 3.3.4 `buildSingleCommits`). 이 실험이 D-11의 근거를 저수준에서 보여 준다.
   - (과제 밖 추가 장면) 5건(n~n+4)을 받고 n만 처리한 뒤 인자 없이 `commitSync()` → n+5가 commit돼 새 consumer가 n+5부터 받는다(유실). 인자 없는 commit은 처리한 곳이 아니라 poll이 옮겨 놓은 position을 commit한다. 실험 topic에서 구매 활동 없이 한다.
+  - (과제 밖 추가 장면 2) 5건을 쌓아 두고 `max.poll.records=2`로 poll 한 번 → 돌려준 기록 [m, m+1], position m+2, 인자 없는 `commitSync()` 뒤 committed m+2. position은 broker에 쌓인 만큼이 아니라 poll이 돌려준 만큼만 움직인다(kafka-clients 3.8.1 `FetchCollector#fetchRecords`). 네트워크로 미리 받아 둔(prefetch) 양 자체는 측정하지 않았다.
 - **C. Spring listener 실패와 재시작**: D-20의 흐름을 따른다(장애 주입 → 멈춤 확인 → committed offset 고정 → 장애 제거 → registry `start()` → 같은 offset부터 이어 처리). 장애는 세 방식으로 주입하고, 방식마다 증명하는 것이 다르다.
   - **C-1. 이음매의 가짜**: consumer가 저장을 맡기는 인터페이스 자리에 켜면 예외를 던지는 구현을 넣는다(D-16과 같은 방식). 멈춤과 재개의 **흐름**을 결정적으로 보인다. 던지는 예외를 우리가 고르므로, 실제 DB가 그 예외를 던지는지는 증명하지 못한다.
   - **C-2. 다른 연결의 락**: 별도 커넥션이 consumer가 insert할 자리를 잠근 채 버텨 락 타임아웃을 낸다. 롤백하면 장애가 걷힌다(3주차 락 실습 방식). 진짜 DB 예외가 우리 분류에서 "다시 하면 풀리는 실패"로 가는지를 증명한다. 기본 `innodb_lock_wait_timeout`(50초)을 consumer 연결에서 짧게 줄여야 하고, 무엇을 잠가야 insert가 막히는지 구현 때 확인한다.
   - **C-3. DB 자체를 멈춤**: 공용 MySQL 컨테이너는 JVM 전체가 static으로 공유하고 `modules/*`는 수정 금지라, 이 테스트 전용 컨테이너를 앱 쪽 테스트에서 따로 띄우고 datasource를 덮어쓴다. 연결 자체가 끊긴 장애와 커넥션 풀이 회복하는 과정까지 보인다. 가장 실제에 가깝고 가장 느리다. **`check`에서 빼고 필요할 때만 따로 돌린다.** 매번 지켜 주는 것(연결 끊김에서의 멈춤·재개)은 C-1·C-2가 흐름과 분류로 대부분 덮고, 남는 건 커넥션 풀 회복이다. 그건 datasource·커넥션 풀 설정이나 실패 분류 코드를 바꿀 때 확인하면 된다. 떼는 방법: `@Tag("experiment")`를 붙여 기본 `test`에서 제외하고, `./gradlew :apps:commerce-streamer:experimentTest`로 따로 돌린다. 장애는 컨테이너 stop, 복구는 같은 컨테이너 start다. 다시 켜도 JDBC URL이 같도록 host 포트를 고정한다. pause는 쓰지 않는다. 열린 연결이 끊기지 않고 매달리기 때문이다(MySQL 드라이버 socketTimeout 기본값이 무한). 커넥션 획득 대기(Hikari connection-timeout)는 이 테스트에서만 짧게 둔다.
+  - **(과제 밖 추가 장면) error handler 비교**: DB 없이 spring-kafka container를 코드로 띄우고(`MANUAL_IMMEDIATE`), 3건(m, m+1, m+2) 중 m+1에서만 계속 예외를 던진다. error handler만 바꿔 같은 흐름을 두 번 돌린다.
+    - `DefaultErrorHandler`(Spring 기본값, `FixedBackOff(0, 9)`): m+1을 10번 시도한 뒤 로그만 남기고 넘어간다. ack한 기록 [m, m+2], committed m+3. **m+1은 처리되지 않은 채 지나간다.** 실패한 기록을 그 자리에서 commit하지는 않지만(`MANUAL_IMMEDIATE`는 `ackCurrent`의 commit 분기를 타지 않는다), 다음 기록의 ack가 그 offset + 1을 commit하면서 건너뛴다.
+    - `CommonContainerStoppingErrorHandler`(과제 지정): m+1을 1번 시도하고 멈춘다. ack한 기록 [m], committed m+1, container running=false.
+    - 의미: "예외를 잡지 않으면 ack에 닿지 않는다"(INV-606)만으로는 유실을 막지 못한다. 실패한 기록 뒤의 ack가 그 기록을 덮지 않게 하는 건 멈춤 handler다. D-29의 "모르면 멈춘다"가 기본값에서는 "열 번 해 보고 넘어간다"가 된다.
 - **근거**: concurrency 1(과제 지정)은 주문별 순서 때문이 아니다. 같은 key는 같은 partition으로 가고 partition은 group 안에서 consumer 하나만 맡으므로, concurrency가 2여도 같은 주문은 한 스레드에서만 처리된다. 1로 두면 offset 기록이 한 스레드에서 한 줄로 나와 실험 관찰이 단순해진다. concurrency를 올려도 `CommonContainerStoppingErrorHandler`는 부모 container를 멈추므로 실패 하나가 앱의 consumer 전체를 세운다(D-8).
 
 ## 구현 기반
