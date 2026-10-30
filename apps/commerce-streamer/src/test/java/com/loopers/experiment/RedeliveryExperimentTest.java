@@ -32,6 +32,7 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -59,6 +60,8 @@ import static org.junit.jupiter.api.Assertions.assertAll;
  *
  * <p>추가 장면(과제 밖)은 인자 없는 {@code commitSync()}가 처리한 곳이 아니라 poll이 옮겨 놓은 position을 commit해
  * 처리하지 않은 기록을 건너뛰게 만드는 것을 보인다. 구매 활동 handler 없이 실험 topic에서만 한다.
+ * 추가 장면 2(과제 밖)는 그 position이 broker에 쌓인 만큼이 아니라 poll이 돌려준 만큼만 움직이는 것을 보인다
+ * (kafka-clients 3.8.1 {@code FetchCollector#fetchRecords}).
  */
 @SpringBootTest
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -95,13 +98,19 @@ class RedeliveryExperimentTest {
     }
 
     private static KafkaConsumer<String, byte[]> consumer(String topic, String group) {
-        KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(Map.of(
+        return consumer(topic, group, Map.of());
+    }
+
+    private static KafkaConsumer<String, byte[]> consumer(String topic, String group, Map<String, Object> extra) {
+        Map<String, Object> config = new HashMap<>(Map.of(
             ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KafkaTestContainers.bootstrapServers(),
             ConsumerConfig.GROUP_ID_CONFIG, group,
             ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
             ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class,
             ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
             ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest"));
+        config.putAll(extra);
+        KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(config);
         consumer.subscribe(List.of(topic));
         return consumer;
     }
@@ -277,6 +286,57 @@ class RedeliveryExperimentTest {
                 () -> assertThat(next.offset()).isEqualTo(m + 5),
                 () -> assertThat(firstFetched.offset()).isEqualTo(m + 5),
                 () -> assertThat(newFetched).extracting(ConsumerRecord::offset).doesNotContain(m + 1, m + 2, m + 3, m + 4)
+            );
+        }
+    }
+
+    @DisplayName("B 추가 2(과제 밖): max.poll.records=2로 5건이 쌓인 partition을 poll하면 한 번에 2건만 돌려주고, "
+        + "position과 인자 없는 commitSync()의 값은 돌려준 만큼(m+2)이다 — 5건 전부가 아니다.")
+    @Test
+    void positionFollowsReturnedRecordsNotAvailable() {
+        String topic = KafkaProbe.unique("experiment-redelivery-returned");
+        String group = KafkaProbe.unique("experiment-redelivery-returned-group");
+        KafkaTestContainers.createTopic(topic);
+        int partition = 0;
+        TopicPartition tp = new TopicPartition(topic, partition);
+
+        try (KafkaProbe kafka = new KafkaProbe(topic, group)) {
+            // arrange — 한 partition에 5건(m ~ m+4)을 먼저 쌓아 둔다
+            List<RecordMetadata> sent = new ArrayList<>();
+            for (int i = 0; i < 5; i++) {
+                sent.add(kafka.send(partition, "returned-" + i, ("returned-" + i).getBytes(StandardCharsets.UTF_8)));
+            }
+            long m = sent.get(0).offset();
+
+            // act — 기록이 처음 돌아온 poll 한 번만 보고, 곧바로 position을 읽고 인자 없이 commit한다
+            List<ConsumerRecord<String, byte[]>> firstBatch = new ArrayList<>();
+            List<ConsumerRecord<String, byte[]>> rest;
+            long position;
+            try (KafkaConsumer<String, byte[]> consumer1 = consumer(topic, group,
+                Map.of(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 2))) {
+                await().atMost(WAIT).pollInSameThread().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(1))
+                    .until(() -> {
+                        consumer1.poll(POLL).forEach(firstBatch::add);
+                        return !firstBatch.isEmpty();
+                    });
+                position = consumer1.position(tp);
+                consumer1.commitSync();
+                rest = pollUntil(consumer1, tp, m + 2, 3, new ArrayList<>());
+                consumer1.close(CLOSE);
+            }
+            long committed = kafka.committed(partition);
+
+            // assert
+            System.out.printf("[B-extra2] 쌓인 기록 m=%d ~ m+4=%d, max.poll.records=2%n", m, m + 4);
+            System.out.printf("[B-extra2] 첫 poll이 돌려준 기록 %s, position=%d, commitSync() 뒤 committed=%d (=m+2), "
+                    + "이어서 받은 기록 %s%n",
+                firstBatch.stream().map(r -> String.valueOf(r.offset())).toList(), position, committed,
+                rest.stream().map(r -> String.valueOf(r.offset())).toList());
+            assertAll(
+                () -> assertThat(firstBatch).extracting(ConsumerRecord::offset).containsExactly(m, m + 1),
+                () -> assertThat(position).isEqualTo(m + 2),
+                () -> assertThat(committed).isEqualTo(m + 2),
+                () -> assertThat(rest).extracting(ConsumerRecord::offset).containsExactly(m + 2, m + 3, m + 4)
             );
         }
     }
